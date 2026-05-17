@@ -1,0 +1,109 @@
+version: '3.8'
+
+services:
+  # ==================================================================
+  # 1. GATEWAY INTELIGENTE (HUB COORDENADOR)
+  # ==================================================================
+  gateway:
+    build:
+      context: .
+      dockerfile: ./gateway/Dockerfile
+    container_name: gateway
+    ports:
+      - "5000:5000/udp"  # Ingestão de telemetria contínua
+      - "5001:5001/tcp"  # Interface de streaming analítico e atuação
+    networks:
+      - smart_city_net
+    restart: always
+    # Implementação de checagem ativa de prontidão na camada de transporte
+    healthcheck:
+      test: [
+        "CMD-SHELL", 
+        "python -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1.0); s.connect((\"127.0.0.1\", 5001)); s.close()' || exit 1"
+      ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+  # ==================================================================
+  # 2. SENSOR DE CLIMA (NÓ C - CONTÍNUO)
+  # ==================================================================
+  sensor_clima:
+    build:
+      context: .
+      dockerfile: ./sensor_c/Dockerfile
+    container_name: sensor_clima
+    # Condiciona a inicialização à integridade atestada do coordenador
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - smart_city_net
+    restart: on-failure
+
+  # ==================================================================
+  # 3. POSTE INTELIGENTE (NÓ LUA - CONTROLÁVEL)
+  # ==================================================================
+  sensor_posto:
+    build:
+      context: .
+      dockerfile: ./sensor_lua/Dockerfile
+    container_name: sensor_posto
+    # Garante que o nó só despache a descoberta quando o Gateway puder ouvir
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - smart_city_net
+    restart: on-failure
+
+# ==================================================================
+  # 4. SEMAFORO (NÓ JAVA - CONTÍNUO)
+  # ==================================================================
+  sensor_java:
+      build:
+        context: .
+        dockerfile: ./sensor_java/Dockerfile
+      container_name: sensor_semaforo
+      depends_on:
+        gateway:
+          condition: service_healthy
+      networks:
+        - smart_city_net
+      restart: on-failure
+
+  # ==================================================================
+  # 5. CÂMERA DE TRÁFEGO (NÓ PYTHON - CONTROLÁVEL)
+  # ==================================================================
+  sensor_camera:
+    build:
+      context: .
+      dockerfile: ./sensor_python/Dockerfile
+    container_name: sensor_camera
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - smart_city_net
+    restart: on-failure   
+
+  # ==================================================================
+  # 6. CLIENTE ANALÍTICO (DASHBOARD STREAMLIT)
+  # ==================================================================
+  dashboard:
+    build:
+      context: .
+      dockerfile: ./client/Dockerfile
+    container_name: dashboard
+    ports:
+      - "8501:8501" # Interface visual exposta
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - smart_city_net
+
+networks:
+  smart_city_net:
+    driver: bridge

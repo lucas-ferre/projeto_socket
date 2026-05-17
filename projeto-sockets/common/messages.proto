@@ -1,0 +1,129 @@
+syntax = "proto3";
+
+package smartcity;
+
+message SensorData {
+  string sensor_id = 1;
+  int64 timestamp = 2;
+  uint64 sequence = 3;
+  double value = 4;
+}
+
+// ====================================================================
+// DEFINIÇÕES DE ENUMERAÇÕES (TOPOLOGIA, CONTROLE E OPERAÇÃO)
+// ====================================================================
+
+enum DeviceType {
+  DEVICE_TYPE_UNKNOWN = 0;
+  DEVICE_TYPE_TRAFFIC_LIGHT = 1;
+  DEVICE_TYPE_LAMP_POST = 2;
+  DEVICE_TYPE_WEATHER_STATION = 3;
+  DEVICE_TYPE_CAMERA = 4;           
+  DEVICE_TYPE_AIR_QUALITY = 5;      
+}
+
+enum DeviceStatus {
+  STATUS_UNKNOWN = 0;
+  STATUS_ON = 1;
+  STATUS_OFF = 2;
+  STATUS_ERROR = 3;
+}
+
+enum RequestType {
+  REQUEST_TYPE_UNKNOWN = 0;
+  REQUEST_TYPE_LIST_DEVICES = 1;
+  REQUEST_TYPE_SEND_COMMAND = 2;
+  REQUEST_TYPE_ANALYTICS_QUERY = 3;
+}
+
+enum QueryOp {
+  OP_UNKNOWN = 0;
+  OP_AVERAGE = 1;
+  OP_STD_DEV = 2;
+  OP_MAX_VARIATION = 3;
+}
+
+message Metric {
+  string name = 1;
+  double value = 2;
+  string unit = 3;
+}
+
+// ====================================================================
+// PACOTES DE CAMADA UDP (INGESTÃO DE MÉTRICAS E HANDSHAKE)
+// ====================================================================
+
+message DiscoveryResponse {
+  string message_id = 1;      // ID único da mensagem de descoberta (UUID/Hash)
+  int64 timestamp = 2;        // Instante exato do disparo (Epoch)
+  string device_id = 3;
+  DeviceType type = 4;
+  string ip_address = 5;
+  int32 control_port = 6;
+  DeviceStatus initial_status = 7;
+  bool is_controllable = 8;
+}
+
+message DataPayload {
+  string message_id = 1;      // ID único do datagrama de telemetria
+  int64 timestamp = 2;        // Momento de extração da leitura física
+  string device_id = 3;
+  DeviceStatus current_status = 4;
+  repeated Metric metrics = 5;
+}
+
+// ====================================================================
+// PACOTES DE CAMADA TCP (ATUAÇÃO REMOTA E ANÁLISE OLAP)
+// ====================================================================
+
+message ConfigCommand {
+  string command_id = 1;      // Identificador único do frame de controle
+  int64 timestamp = 2;        // Instante de despacho da ordem pelo Proxy
+  bool update_status = 3;
+  DeviceStatus target_status = 4;
+  bool update_frequency = 5;
+  int32 new_frequency_secs = 6;
+  string target_device_id = 7;  // Dispositivo virtual alvo dentro de um nó multi-dispositivo
+}
+
+message ConfigResponse {
+  string message_id = 1;      // ID único da confirmação do nó atuado
+  string command_id = 2;      // Chave relacional vinculada à requisição de origem
+  int64 timestamp = 3;        // Instante da efetivação do I/O
+  bool success = 4;
+  string message = 5;
+  DeviceStatus updated_status = 6;
+  int32 updated_frequency_secs = 7;
+}
+
+message DeviceInfo {
+  string device_id = 1;
+  DeviceType type = 2;
+  DeviceStatus status = 3;
+  string ip_address = 4;
+  int32 control_port = 5;
+  bool is_controllable = 6;
+  int64 last_seen_timestamp = 7;
+}
+
+message ClientRequest {
+  string message_id = 1;      // ID único da requisição de multiplexação
+  int64 timestamp = 2;        // Instante de emissão pelo cliente (Streamlit)
+  RequestType type = 3;
+  string target_device_id = 4;
+  ConfigCommand command_payload = 5;
+  string query_metric = 6;
+  QueryOp query_op = 7;
+  int64 start_timestamp = 8;
+  int64 end_timestamp = 9;
+}
+
+message ClientResponse {
+  string message_id = 1;      // ID único de devolução assíncrona do Gateway
+  int64 timestamp = 2;        // Instante da consolidação dos dados em memória
+  bool success = 3;
+  string message = 4;
+  repeated DeviceInfo devices = 5;
+  double analytics_result = 6;
+  string result_metadata = 7;
+}
