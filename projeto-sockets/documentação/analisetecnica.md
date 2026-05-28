@@ -12,7 +12,7 @@ A plataforma é composta por:
 * Comunicação híbrida UDP/TCP;
 * Persistência SQLite;
 * Serialização via Protocol Buffers;
-* Infraestrutura conteinerizada com Docker.
+* Infraestrutura conteinerizada com Docker ou Podman.
 
 A solução demonstra integração entre:
 
@@ -33,7 +33,7 @@ A plataforma é composta por:
 * Comunicação híbrida UDP/TCP;
 * Persistência SQLite;
 * Serialização via Protocol Buffers;
-* Infraestrutura conteinerizada com Docker.
+* Infraestrutura conteinerizada com Docker ou Podman.
 
 A solução demonstra integração entre:
 
@@ -611,12 +611,12 @@ Ausências importantes:
 
 ---
 
-# 16. Dockerização
+# 16. Conteinerização
 
 O sistema utiliza:
 
-* Docker;
-* Docker Compose;
+* Docker ou Podman;
+* Docker Compose ou Podman Compose;
 * bridge network;
 * healthchecks.
 

@@ -27,7 +27,7 @@ Os containers incluem:
 Antes de executar o sistema, é necessário possuir:
 
 * Docker instalado com Docker Compose habilitado; ou
-* Podman instalado com suporte a Compose (`podman compose`) ou `podman-compose`.
+* Podman instalado e acessível no PATH, com suporte a Compose (`podman compose`) ou `podman-compose`.
 
 ---
 
@@ -70,13 +70,24 @@ podman --version
 podman compose version
 ```
 
+No Windows, se `podman --version` não for reconhecido logo após a instalação, abra um novo terminal ou adicione `C:\Program Files\RedHat\Podman` ao PATH.
+
 Algumas instalações expõem o Compose como binário separado:
 
 ```bash
 podman-compose version
 ```
 
-Neste guia, qualquer comando `docker compose` pode ser substituído por `podman compose` ou `podman-compose`.
+O comando `podman compose` usa um provider externo. Se a saída mostrar que ele está executando `docker-compose.exe`, o ambiente ainda depende do Docker Compose para interpretar o arquivo. Para evitar esse acoplamento, use `podman-compose` diretamente ou configure o provider do Podman para apontar para `podman-compose`.
+
+No PowerShell, a configuração temporária do provider pode ser feita assim:
+
+```powershell
+$env:PODMAN_COMPOSE_PROVIDER = "podman-compose"
+podman compose version
+```
+
+Neste guia, qualquer comando `docker compose` pode ser substituído por `podman compose` ou `podman-compose`, desde que o provider escolhido esteja configurado corretamente.
 
 ---
 
@@ -141,7 +152,7 @@ podman compose build
 
 Função do comando:
 
-* cria as imagens Docker;
+* cria as imagens de container;
 * instala dependências;
 * executa os Dockerfiles;
 * prepara o ambiente dos serviços.
@@ -254,7 +265,7 @@ O dashboard permite:
 
 Quando o sistema inicia:
 
-1. o Docker cria a rede interna;
+1. o runtime Compose cria a rede interna;
 2. o Gateway Central é iniciado;
 3. o banco SQLite é preparado;
 4. os sensores iniciam;
@@ -277,6 +288,12 @@ Para visualizar logs de todos os serviços:
 docker compose logs
 ```
 
+Com Podman:
+
+```bash
+podman compose logs
+```
+
 ---
 
 ## 8.2 Logs em Tempo Real
@@ -285,6 +302,12 @@ Para acompanhar logs continuamente:
 
 ```bash
 docker compose logs -f
+```
+
+Com Podman:
+
+```bash
+podman compose logs -f
 ```
 
 A opção:
@@ -317,6 +340,13 @@ ou:
 docker compose logs sensor-python
 ```
 
+Com Podman:
+
+```bash
+podman compose logs gateway
+podman compose logs sensor-python
+```
+
 Função:
 
 * visualizar erros;
@@ -331,6 +361,12 @@ Para reiniciar todos os serviços:
 
 ```bash
 docker compose restart
+```
+
+Com Podman:
+
+```bash
+podman compose restart
 ```
 
 Função:
@@ -349,6 +385,12 @@ Execute:
 docker compose down
 ```
 
+Com Podman:
+
+```bash
+podman compose down
+```
+
 Função:
 
 * parar todos os containers;
@@ -363,6 +405,12 @@ Execute:
 
 ```bash
 docker compose stop
+```
+
+Com Podman:
+
+```bash
+podman compose stop
 ```
 
 Função:
@@ -392,6 +440,14 @@ Em seguida:
 docker compose up
 ```
 
+Com Podman:
+
+```bash
+podman compose down
+podman compose build --no-cache
+podman compose up
+```
+
 Função:
 
 * reconstruir imagens do zero;
@@ -414,6 +470,13 @@ ou:
 
 ```bash
 docker compose up sensor-python
+```
+
+Com Podman:
+
+```bash
+podman compose up gateway
+podman compose up sensor-python
 ```
 
 Isso é útil para:

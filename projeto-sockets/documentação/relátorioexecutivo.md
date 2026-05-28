@@ -158,9 +158,9 @@ Funcionalidades:
 
 ---
 
-# 2.8 Docker
+# 2.8 Conteinerização
 
-Docker e Docker Compose foram utilizados para:
+Docker Compose ou Podman Compose podem ser utilizados para:
 
 * conteinerização;
 * isolamento de serviços;
@@ -426,7 +426,7 @@ Novos sensores podem ser adicionados sem necessidade de alteração significativ
 
 ## Conteinerização
 
-Toda a infraestrutura pode ser executada via Docker Compose.
+Toda a infraestrutura pode ser executada via Docker Compose ou Podman Compose, usando o mesmo `docker-compose.yml`.
 
 ---
 

@@ -94,7 +94,7 @@ O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclu
 Escolha uma das opções:
 
 - [Docker Engine](https://docs.docker.com/engine/install/) >= 24 com [Docker Compose](https://docs.docker.com/compose/install/) plugin v2
-- Podman com suporte a Compose (`podman compose`) ou o binário `podman-compose`
+- Podman instalado e acessível no PATH, com suporte a Compose (`podman compose`) ou o binário `podman-compose`
 
 ### Executar o sistema completo
 
@@ -130,7 +130,7 @@ podman compose logs -f gateway sensor_clima sensor_posto
 podman compose down
 ```
 
-Se a instalação expuser apenas `podman-compose`, use `podman-compose` no lugar de `podman compose`. O arquivo `docker-compose.yml` é mantido como fonte única para os dois runtimes.
+Se a instalação expuser apenas `podman-compose`, use `podman-compose` no lugar de `podman compose`. No Windows, confira `podman compose version`: se a saída informar que está executando `docker-compose.exe` como provider externo, instale/use `podman-compose` ou configure `PODMAN_COMPOSE_PROVIDER=podman-compose` para evitar depender do Docker Compose. O arquivo `docker-compose.yml` é mantido como fonte única para os dois runtimes.
 
 ### Acessar o dashboard
 
@@ -143,14 +143,22 @@ http://localhost:8501
 ### Inspecionar o banco de dados
 
 ```bash
-# Com Podman, troque `docker exec` por `podman exec`.
-
 # Dispositivos registrados
 docker exec gateway sqlite3 db/smartcity_gateway.db \
   "SELECT device_id, type, status, last_seen FROM devices;"
 
 # Métricas mais recentes
 docker exec gateway sqlite3 db/smartcity_gateway.db \
+  "SELECT device_id, metric_name, value, unit FROM metrics ORDER BY id DESC LIMIT 20;"
+```
+
+Com Podman:
+
+```bash
+podman exec gateway sqlite3 db/smartcity_gateway.db \
+  "SELECT device_id, type, status, last_seen FROM devices;"
+
+podman exec gateway sqlite3 db/smartcity_gateway.db \
   "SELECT device_id, metric_name, value, unit FROM metrics ORDER BY id DESC LIMIT 20;"
 ```
 
@@ -166,7 +174,7 @@ docker exec gateway sqlite3 db/smartcity_gateway.db \
 | `gateway` | **5001** | TCP | Interface cliente (dashboard) |
 | `dashboard` | **8501** | TCP/HTTP | Interface web Streamlit |
 
-### Internas (Docker network)
+### Internas (rede Compose)
 
 | Serviço | Porta | Protocolo | Descrição |
 |---------|-------|-----------|-----------|
