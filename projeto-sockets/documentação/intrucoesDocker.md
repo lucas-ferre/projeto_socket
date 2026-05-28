@@ -1,8 +1,8 @@
-# Guia de Execução Docker — Sistema Distribuído Smart City
+# Guia de Execução Docker ou Podman — Sistema Distribuído Smart City
 
 # 1. Visão Geral
 
-O sistema foi desenvolvido para ser executado utilizando Docker e Docker Compose.
+O sistema foi desenvolvido para ser executado utilizando containers com Docker Compose ou Podman Compose.
 
 A utilização de containers permite:
 
@@ -12,7 +12,7 @@ A utilização de containers permite:
 * eliminação de dependências locais;
 * inicialização simplificada.
 
-Toda a infraestrutura do projeto é iniciada automaticamente através do Docker Compose.
+Toda a infraestrutura do projeto é iniciada automaticamente através do arquivo `docker-compose.yml`, que pode ser lido pelos dois runtimes.
 
 Os containers incluem:
 
@@ -26,8 +26,8 @@ Os containers incluem:
 
 Antes de executar o sistema, é necessário possuir:
 
-* Docker instalado;
-* Docker Compose habilitado.
+* Docker instalado com Docker Compose habilitado; ou
+* Podman instalado com suporte a Compose (`podman compose`) ou `podman-compose`.
 
 ---
 
@@ -61,6 +61,25 @@ Esse comando verifica se o Docker Compose está disponível.
 
 ---
 
+## 2.3 Verificar Podman Compose
+
+Caso a equipe opte por Podman, execute:
+
+```bash
+podman --version
+podman compose version
+```
+
+Algumas instalações expõem o Compose como binário separado:
+
+```bash
+podman-compose version
+```
+
+Neste guia, qualquer comando `docker compose` pode ser substituído por `podman compose` ou `podman-compose`.
+
+---
+
 # 3. Estrutura Geral do Ambiente
 
 O sistema utiliza múltiplos containers interconectados.
@@ -88,7 +107,7 @@ Sensor C   Sensor Java   Sensor Lua
            Sensor Python
 ```
 
-Todos os containers se comunicam através da rede interna criada automaticamente pelo Docker Compose.
+Todos os containers se comunicam através da rede interna criada automaticamente pelo runtime Compose.
 
 ---
 
@@ -111,7 +130,13 @@ cd smart-city-system
 Execute:
 
 ```bash
-docker-compose build 
+docker compose build
+```
+
+Com Podman:
+
+```bash
+podman compose build
 ```
 
 Função do comando:
@@ -130,7 +155,13 @@ Esse processo pode levar alguns minutos na primeira execução.
 Execute:
 
 ```bash
-docker-compose up
+docker compose up
+```
+
+Com Podman:
+
+```bash
+podman compose up
 ```
 
 Função do comando:
@@ -153,6 +184,12 @@ Para executar o sistema em segundo plano:
 docker compose up -d
 ```
 
+Com Podman:
+
+```bash
+podman compose up -d
+```
+
 Função:
 
 * executa os containers sem bloquear o terminal;
@@ -166,6 +203,12 @@ Execute:
 
 ```bash
 docker ps
+```
+
+Com Podman:
+
+```bash
+podman ps
 ```
 
 Função:
@@ -381,9 +424,9 @@ Isso é útil para:
 
 ---
 
-# 13. Rede Interna do Docker
+# 13. Rede Interna do Compose
 
-O Docker Compose cria automaticamente uma bridge network.
+O runtime Compose cria automaticamente uma bridge network.
 
 Isso permite que os containers se comuniquem utilizando:
 
@@ -405,7 +448,7 @@ Os sensores utilizam essa rede para enviar telemetria ao Gateway.
 
 O banco SQLite permanece dentro do ambiente do container.
 
-Dependendo da configuração do Docker Compose, volumes podem ser utilizados para:
+Dependendo da configuração do Compose, volumes podem ser utilizados para:
 
 * persistência;
 * backup;
@@ -415,18 +458,18 @@ Dependendo da configuração do Docker Compose, volumes podem ser utilizados par
 
 # 15. Comandos Mais Importantes
 
-| Comando                   | Função                       |
-| ------------------------- | ---------------------------- |
-| docker compose build      | Construir imagens            |
-| docker compose up         | Iniciar sistema              |
-| docker compose up --build | Construir e inicia o sistema |
-| docker compose up -d      | Executar em background       |
-| docker compose logs       | Visualizar logs              |
-| docker compose logs -f    | Monitorar logs em tempo real |
-| docker compose restart    | Reiniciar serviços           |
-| docker compose stop       | Parar containers             |
-| docker compose down       | Encerrar ambiente            |
-| docker ps                 | Ver containers ativos        |
+| Docker | Podman | Função |
+| ------ | ------ | ------ |
+| docker compose build | podman compose build | Construir imagens |
+| docker compose up | podman compose up | Iniciar sistema |
+| docker compose up --build | podman compose up --build | Construir e iniciar o sistema |
+| docker compose up -d | podman compose up -d | Executar em background |
+| docker compose logs | podman compose logs | Visualizar logs |
+| docker compose logs -f | podman compose logs -f | Monitorar logs em tempo real |
+| docker compose restart | podman compose restart | Reiniciar serviços |
+| docker compose stop | podman compose stop | Parar containers |
+| docker compose down | podman compose down | Encerrar ambiente |
+| docker ps | podman ps | Ver containers ativos |
 
 ---
 
@@ -440,6 +483,12 @@ Fluxo recomendado:
 docker compose build
 ```
 
+Com Podman:
+
+```bash
+podman compose build
+```
+
 ---
 
 ## 2. Iniciar containers
@@ -448,12 +497,24 @@ docker compose build
 docker compose up -d
 ```
 
+Com Podman:
+
+```bash
+podman compose up -d
+```
+
 ---
 
 ## 3. Verificar containers
 
 ```bash
 docker ps
+```
+
+Com Podman:
+
+```bash
+podman ps
 ```
 
 ---
@@ -472,12 +533,24 @@ http://localhost:8501
 docker compose logs -f
 ```
 
+Com Podman:
+
+```bash
+podman compose logs -f
+```
+
 ---
 
 ## 6. Encerrar sistema
 
 ```bash
 docker compose down
+```
+
+Com Podman:
+
+```bash
+podman compose down
 ```
 
 ---

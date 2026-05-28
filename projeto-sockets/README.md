@@ -27,7 +27,7 @@ Sensores heterogêneos (C, Lua, Java, Python) comunicam-se com um gateway centra
 O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclusivamente com o Gateway central.
 
 ```
-                         Docker Network: smart_city_net
+                         Rede Compose: smart_city_net
 ┌────────────────────────────────────────────────────────────────────┐
 │                                                                    │
 │  ┌──────────────────┐   UDP :5000 (Telemetria)                    │
@@ -83,7 +83,7 @@ O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclu
 | Sensor Câmera | Python 3.11 | threading | `protobuf` |
 | Serialização | — | — | Protocol Buffers 3 |
 | Persistência | — | — | SQLite 3 (WAL mode) |
-| Orquestração | — | Docker Compose | — |
+| Orquestração | — | Docker Compose ou Podman Compose | — |
 
 ---
 
@@ -91,10 +91,14 @@ O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclu
 
 ### Pré-requisitos
 
-- [Docker Engine](https://docs.docker.com/engine/install/) >= 24
-- [Docker Compose](https://docs.docker.com/compose/install/) plugin v2
+Escolha uma das opções:
+
+- [Docker Engine](https://docs.docker.com/engine/install/) >= 24 com [Docker Compose](https://docs.docker.com/compose/install/) plugin v2
+- Podman com suporte a Compose (`podman compose`) ou o binário `podman-compose`
 
 ### Executar o sistema completo
+
+Com Docker:
 
 ```bash
 # Build e inicialização de todos os serviços
@@ -110,6 +114,24 @@ docker compose logs -f gateway sensor_clima sensor_posto
 docker compose down
 ```
 
+Com Podman:
+
+```bash
+# Build e inicialização de todos os serviços
+podman compose up --build
+
+# Modo background
+podman compose up --build -d
+
+# Acompanhar logs em tempo real
+podman compose logs -f gateway sensor_clima sensor_posto
+
+# Parar tudo
+podman compose down
+```
+
+Se a instalação expuser apenas `podman-compose`, use `podman-compose` no lugar de `podman compose`. O arquivo `docker-compose.yml` é mantido como fonte única para os dois runtimes.
+
 ### Acessar o dashboard
 
 Após a inicialização (aguarde o healthcheck do gateway ser aprovado):
@@ -121,6 +143,8 @@ http://localhost:8501
 ### Inspecionar o banco de dados
 
 ```bash
+# Com Podman, troque `docker exec` por `podman exec`.
+
 # Dispositivos registrados
 docker exec gateway sqlite3 db/smartcity_gateway.db \
   "SELECT device_id, type, status, last_seen FROM devices;"
@@ -159,6 +183,13 @@ docker exec gateway sqlite3 db/smartcity_gateway.db \
 ## Variáveis de Ambiente
 
 Configure no `docker-compose.yml` sob a chave `environment:` de cada serviço.
+
+### gateway
+
+| Variável | Padrão | Descrição |
+|----------|--------|-----------|
+| `DISCOVERY_PROBE_INTERVAL_SECS` | `15` | Intervalo dos probes multicast que pedem aos sensores para reanunciar a topologia |
+| `MULTICAST_TTL` | `1` | TTL dos pacotes multicast de recuperação |
 
 ### sensor_posto (Lua)
 
@@ -351,7 +382,7 @@ Tentativa 3 →  800 ms + jitter aleatório  (máx. 1500 ms)
 
 ### Redescoberta automática (Multicast Recovery)
 
-O gateway transmite `SMARTCITY_DISCOVERY_PROBE` via multicast `239.0.0.1:5000` a cada 10 segundos.
+O gateway transmite `SMARTCITY_DISCOVERY_PROBE` via multicast `239.0.0.1:5000` a cada 15 segundos por padrão.
 Todos os sensores escutam o grupo e re-enviam `DiscoveryResponse`, garantindo recuperação após reinicialização do gateway sem intervenção manual.
 
 ### Jitter de telemetria
@@ -401,7 +432,7 @@ projeto-sockets/
 │   ├── sensor.py               # Câmera de tráfego — threading + shutdown via Event
 │   └── Dockerfile
 │
-└── docker-compose.yml          # Orquestração com healthcheck e depends_on condicional
+└── docker-compose.yml          # Orquestração compatível com Docker Compose e Podman Compose
 ```
 
 ---
@@ -413,4 +444,4 @@ projeto-sockets/
 - **Sensor C multi-frota** registra e envia telemetria para N dispositivos no mesmo processo, com `pthread` dedicada ao listener multicast
 - **Sensor Lua** implementa scheduling cooperativo manual (sem threads) via `socket.sleep` e timestamps de controle
 - **Sensor Java** usa `volatile` nos campos de estado para segurança entre threads sem overhead de `synchronized` completo
-- **Healthcheck** garante que o TCP :5001 do gateway responda antes de os sensores iniciarem — elimina race conditions na inicialização do compose# projeto_socket
+- **Healthcheck** garante que o TCP :5001 do gateway responda antes de os sensores iniciarem, enquanto os probes multicast periódicos permitem re-sincronização caso algum runtime Compose inicie serviços fora da ordem esperada

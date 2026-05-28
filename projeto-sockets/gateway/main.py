@@ -4,6 +4,7 @@ import time
 import statistics
 import struct
 import os
+import socket
 import uuid
 from contextlib import asynccontextmanager
 from typing import Tuple
@@ -37,6 +38,9 @@ UDP_TELEMETRY_PORT = 5000  # Porta dedicada exclusivamente à ingestão de dados
 UDP_DISCOVERY_PORT = 5002  # Porta dedicada exclusivamente aos handshakes de topologia
 TCP_PORT = 5001
 MULTICAST_GROUP = "239.0.0.1"
+DISCOVERY_PROBE_PAYLOAD = b"SMARTCITY_DISCOVERY_PROBE"
+DISCOVERY_PROBE_INTERVAL_SECS = max(1.0, float(os.getenv("DISCOVERY_PROBE_INTERVAL_SECS", "15")))
+MULTICAST_TTL = max(1, int(os.getenv("MULTICAST_TTL", "1")))
 
 # ====================================================================
 # INICIALIZAÇÃO DE BANCO DE DADOS
@@ -271,6 +275,31 @@ class DiscoveryUDPProtocol(asyncio.DatagramProtocol):
         except Exception as e:
             print(f"[Gateway:Erro] Falha na decodificação de datagrama de Descoberta {addr}: {e}")
 
+
+async def multicast_discovery_probe_loop():
+    """Solicita periodicamente que sensores reanunciem a própria topologia."""
+    await asyncio.sleep(2.0)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
+
+            while True:
+                try:
+                    sock.sendto(DISCOVERY_PROBE_PAYLOAD, (MULTICAST_GROUP, UDP_TELEMETRY_PORT))
+                    print(
+                        f"[Gateway:Multicast] Probe de descoberta enviado para "
+                        f"{MULTICAST_GROUP}:{UDP_TELEMETRY_PORT}."
+                    )
+                except OSError as exc:
+                    print(f"[Gateway:Multicast] Falha ao enviar probe de descoberta: {exc}")
+
+                await asyncio.sleep(DISCOVERY_PROBE_INTERVAL_SECS)
+    except asyncio.CancelledError:
+        raise
+    except OSError as exc:
+        print(f"[Gateway:Multicast] Loop de probes indisponível: {exc}")
+
 # ====================================================================
 # CAMADA DE REDE: ATENDIMENTO AO CLIENTE (TCP COM FRAMING)
 # ====================================================================
@@ -388,12 +417,15 @@ async def main():
     
     # Servidor de Controle TCP
     server = await asyncio.start_server(handle_client_request, '0.0.0.0', TCP_PORT)
+    probe_task = asyncio.create_task(multicast_discovery_probe_loop())
     
     print(f"[Gateway] Hub multi-threaded pronto. TCP:{TCP_PORT} | UDP(Telem):{UDP_TELEMETRY_PORT} | UDP(Disc):{UDP_DISCOVERY_PORT}")
     try:
         async with server:
             await server.serve_forever()
     finally:
+        probe_task.cancel()
+        await asyncio.gather(probe_task, return_exceptions=True)
         telemetry_transport.close()
         discovery_transport.close()
         await DB_POOL.close()
