@@ -118,6 +118,12 @@ message ClientRequest {
   int64 end_timestamp = 9;
 }
 
+message DataPoint {
+  int64 timestamp = 1;
+  double value = 2;
+  string device_id = 3;
+}
+
 message ClientResponse {
   string message_id = 1;      // ID único de devolução assíncrona do Gateway
   int64 timestamp = 2;        // Instante da consolidação dos dados em memória
@@ -126,4 +132,5 @@ message ClientResponse {
   repeated DeviceInfo devices = 5;
   double analytics_result = 6;
   string result_metadata = 7;
+  repeated DataPoint graph_points = 8;
 }

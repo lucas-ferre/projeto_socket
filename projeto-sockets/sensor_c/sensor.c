@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <errno.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -180,11 +181,20 @@ static int send_udp_with_retry(const uint8_t *buffer,
 void send_discovery_announcement() {
     if (global_gateway_discovery_res == NULL || global_sockfd < 0) return;
 
+    // Resolve o hostname do próprio container uma única vez
+    static char self_hostname[256] = "";
+    if (self_hostname[0] == '\0') {
+        if (gethostname(self_hostname, sizeof(self_hostname)) != 0) {
+            strncpy(self_hostname, "sensor_clima", sizeof(self_hostname) - 1);
+            self_hostname[sizeof(self_hostname) - 1] = '\0';
+        }
+    }
+
     for (int i = 0; i < DEVICE_COUNT; i++) {
         Smartcity__DiscoveryResponse disc = SMARTCITY__DISCOVERY_RESPONSE__INIT;
         disc.device_id      = global_device_ids[i];
         disc.type           = SMARTCITY__DEVICE_TYPE__DEVICE_TYPE_WEATHER_STATION;
-        disc.ip_address     = "sensor_temperatura";
+        disc.ip_address     = self_hostname;
         disc.initial_status = global_device_statuses[i];
         disc.is_controllable = 0;
         disc.control_port   = 0;
@@ -337,13 +347,13 @@ int main() {
     Smartcity__Metric *metrics_list[NUM_METRICS];
 
     // Nomes e unidades fixos — valores são atualizados a cada ciclo
-    char *names[] = { "temperature", "humidity", "co2", "pm25", "pm10", "aqi" };
-    char *units[] = {          "C",       "%",   "ppm", "ug/m3", "ug/m3", "index" };
+    const char *names[] = { "temperature", "humidity", "co2", "pm25", "pm10", "aqi" };
+    const char *units[] = {          "C",       "%",   "ppm", "ug/m3", "ug/m3", "index" };
 
     for (int i = 0; i < NUM_METRICS; i++) {
         metrics[i]      = (Smartcity__Metric)SMARTCITY__METRIC__INIT;
-        metrics[i].name = names[i];
-        metrics[i].unit = units[i];
+        metrics[i].name = (char *)names[i];
+        metrics[i].unit = (char *)units[i];
         metrics_list[i] = &metrics[i];
     }
 

@@ -173,7 +173,7 @@ async def process_telemetry(payload: messages_pb2.DataPayload, ip: str):
         await db.execute("""
             INSERT OR IGNORE INTO devices (device_id, type, status, ip_address, is_controllable, last_seen)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (payload.device_id, 4, payload.current_status, ip, 0, int(time.time())))
+        """, (payload.device_id, 0, payload.current_status, ip, 0, int(time.time())))
 
         await db.execute("""
             UPDATE devices SET last_seen = ?, status = ? WHERE device_id = ?
@@ -366,21 +366,61 @@ async def handle_client_request(reader: asyncio.StreamReader, writer: asyncio.St
         # Rota: Agregações Estatísticas (OLAP)
         elif req.type == messages_pb2.REQUEST_TYPE_ANALYTICS_QUERY:
             async with get_db_pool().connection() as db:
+                # Extrai timestamp (0), value (1) e device_id (2) em uma única passagem (Otimização I/O)
                 async with db.execute("""
-                    SELECT value FROM metrics 
+                    SELECT timestamp, value, device_id FROM metrics 
                     WHERE metric_name = ? AND timestamp BETWEEN ? AND ?
+                    ORDER BY timestamp ASC
                 """, (req.query_metric, req.start_timestamp, req.end_timestamp)) as cursor:
                     rows = await cursor.fetchall()
-                    vals = [r[0] for r in rows]
+                    vals = [r[1] for r in rows]
 
             if not vals:
                 resp.success, resp.message = False, "Janela de dados insuficiente para computação estatística."
             else:
+                # Avaliação de complexidade O(n) sobre o vetor na memória 'vals'
                 if req.query_op == messages_pb2.OP_AVERAGE:
                     resp.analytics_result = sum(vals) / len(vals)
+                    
                 elif req.query_op == messages_pb2.OP_STD_DEV:
                     resp.analytics_result = statistics.stdev(vals) if len(vals) > 1 else 0.0
-                resp.result_metadata = f"Processados {len(vals)} vetores de dados computados."
+                    
+                elif req.query_op == messages_pb2.OP_MAX_VARIATION:
+                    # Estrutura hash map para agrupar leituras por dispositivo sem nova query SQL
+                    per_device: dict[str, list[float]] = {}
+                    for row in rows:
+                        dev_id = row[2]
+                        val = row[1]
+                        per_device.setdefault(dev_id, []).append(val)
+                        
+                    if per_device:
+                        # Expressão geradora calculando a amplitude pico-a-pico por nó
+                        max_var, best_dev = max(
+                            ((max(v) - min(v), d) for d, v in per_device.items() if len(v) > 1),
+                            default=(0.0, "N/A"),
+                        )
+                        resp.analytics_result = max_var
+                        resp.result_metadata = f"Maior variação: dispositivo {best_dev} — {len(per_device)} nós avaliados."
+                    else:
+                        resp.success, resp.message = False, "Dados insuficientes para calcular variação por dispositivo."
+                        
+                else:
+                    # Encerramento forçado do frame em caso de payload de query malformado
+                    resp.success = False
+                    resp.message = f"Operação analítica desconhecida: {req.query_op}."
+                    resp_bytes = resp.SerializeToString()
+                    writer.write(struct.pack('>I', len(resp_bytes)) + resp_bytes)
+                    await writer.drain()
+                    return
+
+                # Serialização dos pontos de telemetria brutos no Repeated Field Protobuf
+                for row in rows:
+                    pt = resp.graph_points.add()
+                    pt.timestamp = row[0]
+                    pt.value = row[1]
+                    pt.device_id = row[2]
+
+                resp.result_metadata = resp.result_metadata or f"Processados {len(vals)} vetores de dados computados."
 
         # 3. Transmissão da resposta empacotada com Length-Prefix Framing de volta ao cliente
         resp_bytes = resp.SerializeToString()

@@ -134,12 +134,11 @@ def send_discovery_response(target_device_id: str | None = None) -> None:
         try:
             send_udp_message(discovery, GATEWAY_DISCOVERY_PORT)
             print(
-                f"[Sensor Python:Descoberta] Dispositivo={device_id} | Setor={sector} | "
-                f"Camera anunciada em {DEVICE_HOSTNAME}:{CONTROL_TCP_PORT} "
-                f"com status {status_name(current_status)}."
+                f"[sensor_camera] | [Sensor Python:Descoberta] Dispositivo={device_id} | Setor={sector} | "
+                f"Status={status_name(current_status)} | Handshake de presença injetado via porta {GATEWAY_DISCOVERY_PORT}."
             )
         except OSError as exc:
-            print(f"[Sensor Python:Erro] Falha ao enviar descoberta de {device_id}: {exc}")
+            print(f"[sensor_camera] | [Sensor Python:Erro] Falha ao enviar descoberta de {device_id}: {exc}")
 
 
 def build_traffic_metrics() -> list[messages_pb2.Metric]:
@@ -200,19 +199,17 @@ def send_telemetry_payload(device_id: str) -> None:
             vehicles = payload.metrics[0].value
             infractions = payload.metrics[1].value
             print(
-                "[Sensor Python:UDP] Telemetria enviada | "
-                f"Dispositivo={current_device_id} | Setor={sector} | "
-                f"status={status_name(current_status)} | "
-                f"veiculos={vehicles:.0f} veh/min | infracoes={infractions:.0f}"
+                f"[sensor_camera] | [Sensor Python:UDP] Telemetria injetada | "
+                f"Dispositivo={current_device_id} | Setor={sector} | Status={status_name(current_status)} | "
+                f"Veiculos={vehicles:.0f}/min | Infracoes={infractions:.0f}"
             )
         else:
             print(
-                "[Sensor Python:UDP] Heartbeat operacional enviado sem metricas | "
-                f"Dispositivo={current_device_id} | Setor={sector} | "
-                f"status={status_name(current_status)}"
+                f"[sensor_camera] | [Sensor Python:UDP] Heartbeat operacional | "
+                f"Dispositivo={current_device_id} | Setor={sector} | Status={status_name(current_status)}"
             )
     except OSError as exc:
-        print(f"[Sensor Python:Erro] Falha ao enviar telemetria de {current_device_id}: {exc}")
+        print(f"[sensor_camera] | [Sensor Python:Erro] Falha ao enviar telemetria de {current_device_id}: {exc}")
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -257,9 +254,8 @@ def handle_control_client(conn: socket.socket, addr) -> None:
             sector = device["sector"]
 
         print(
-            f"[Sensor Python:TCP] Comando {command.command_id or '<sem-id>'} recebido de "
-            f"{addr[0]}:{addr[1]} | Dispositivo={target_device_id} | Setor={sector} | "
-            f"status={status_name(current_status)} | frequencia={current_frequency}s"
+            f"[sensor_camera] | [Sensor Python:TCP] Comando {command.command_id or '<sem-id>'} recebido | "
+            f"Dispositivo={target_device_id} | Setor={sector} | Status={status_name(current_status)} | Frequencia={current_frequency}s"
         )
 
         response = messages_pb2.ConfigResponse(
@@ -277,7 +273,7 @@ def handle_control_client(conn: socket.socket, addr) -> None:
         send_discovery_response(target_device_id)
 
     except Exception as exc:
-        print(f"[Sensor Python:Erro] Falha no pipeline TCP: {exc}")
+        print(f"[sensor_camera] | [Sensor Python:Erro] Falha no pipeline TCP: {exc}")
         try:
             response = messages_pb2.ConfigResponse(
                 message_id=f"ERR-{uuid.uuid4().hex[:8]}",
@@ -299,7 +295,7 @@ def control_server_loop() -> None:
         server.bind(("0.0.0.0", CONTROL_TCP_PORT))
         server.listen()
         server.settimeout(1.0)
-        print(f"[Sensor Python:TCP] Interface de controle ativa na porta {CONTROL_TCP_PORT}.")
+        print(f"[sensor_camera] | [Sensor Python:TCP] Interface de controle ativa na porta {CONTROL_TCP_PORT}.")
 
         while not shutdown_event.is_set():
             try:
@@ -308,7 +304,7 @@ def control_server_loop() -> None:
                 continue
             except OSError as exc:
                 if not shutdown_event.is_set():
-                    print(f"[Sensor Python:Erro] Falha no accept TCP: {exc}")
+                    print(f"[sensor_camera] | [Sensor Python:Erro] Falha no accept TCP: {exc}")
                 continue
 
             threading.Thread(
@@ -332,7 +328,7 @@ def multicast_listener_loop() -> None:
         sock.settimeout(1.0)
 
         print(
-            f"[Sensor Python:Multicast] Escutando probes em "
+            f"[sensor_camera] | [Sensor Python:Multicast] Escutando probes em "
             f"{MULTICAST_GROUP}:{MULTICAST_PORT}."
         )
 
@@ -343,12 +339,12 @@ def multicast_listener_loop() -> None:
                 continue
             except OSError as exc:
                 if not shutdown_event.is_set():
-                    print(f"[Sensor Python:Erro] Falha no multicast: {exc}")
+                    print(f"[sensor_camera] | [Sensor Python:Erro] Falha no multicast: {exc}")
                 continue
 
             if data == b"SMARTCITY_DISCOVERY_PROBE":
                 print(
-                    f"[Sensor Python:Multicast] Probe recebido de {addr[0]}. "
+                    f"[sensor_camera] | [Sensor Python:Multicast] Probe recebido de {addr[0]}. "
                     "Reenviando descoberta da frota."
                 )
                 send_discovery_response()
@@ -375,10 +371,10 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_shutdown_signal)
 
     print("============================================================")
-    print(f"[Sensor Python] Inicializando frota de {len(DEVICES)} cameras de trafego.")
+    print(f"[sensor_camera] | [Sensor Python] Inicializando frota de {len(DEVICES)} cameras de trafego.")
     for device in DEVICES.values():
-        print(f"           Dispositivo={device['device_id']} | Setor={device['sector']}")
-    print("           Metricas: vehicles_count, infractions")
+        print(f"[sensor_camera] | Dispositivo={device['device_id']} | Setor={device['sector']}")
+    print("[sensor_camera] | Metricas: vehicles_count, infractions")
     print("============================================================")
 
     threading.Thread(target=control_server_loop, daemon=True).start()
@@ -392,7 +388,7 @@ def main() -> None:
 
         shutdown_event.wait(0.2)
 
-    print("[Sensor Python] Encerramento solicitado. Finalizando processo.")
+    print("[sensor_camera] | [Sensor Python] Encerramento solicitado. Finalizando processo.")
 
 
 if __name__ == "__main__":

@@ -132,6 +132,19 @@ podman compose down
 
 Se a instalação expuser apenas `podman-compose`, use `podman-compose` no lugar de `podman compose`. No Windows, confira `podman compose version`: se a saída informar que está executando `docker-compose.exe` como provider externo, instale/use `podman-compose` ou configure `PODMAN_COMPOSE_PROVIDER=podman-compose` para evitar depender do Docker Compose. O arquivo `docker-compose.yml` é mantido como fonte única para os dois runtimes.
 
+No PowerShell, execute os comandos a partir da pasta que contém o `docker-compose.yml`:
+
+```powershell
+cd .\projeto-sockets
+podman compose up --build
+```
+
+Se o terminal ainda não reconhecer `podman` após a instalação, ou se você estiver na pasta acima do projeto, use o helper:
+
+```powershell
+.\projeto-sockets\scripts\podman-compose.ps1 up --build
+```
+
 ### Acessar o dashboard
 
 Após a inicialização (aguarde o healthcheck do gateway ser aprovado):
@@ -440,6 +453,7 @@ projeto-sockets/
 │   ├── sensor.py               # Câmera de tráfego — threading + shutdown via Event
 │   └── Dockerfile
 │
+├── Dockerfile                  # Fallback multi-stage usado por Podman Compose no Windows
 └── docker-compose.yml          # Orquestração compatível com Docker Compose e Podman Compose
 ```
 
@@ -453,3 +467,4 @@ projeto-sockets/
 - **Sensor Lua** implementa scheduling cooperativo manual (sem threads) via `socket.sleep` e timestamps de controle
 - **Sensor Java** usa `volatile` nos campos de estado para segurança entre threads sem overhead de `synchronized` completo
 - **Healthcheck** garante que o TCP :5001 do gateway responda antes de os sensores iniciarem, enquanto os probes multicast periódicos permitem re-sincronização caso algum runtime Compose inicie serviços fora da ordem esperada
+- **Dockerfile raiz** replica os builds dos serviços como estágios nomeados para contornar providers Podman Compose que ignoram `build.dockerfile`

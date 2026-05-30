@@ -18,6 +18,12 @@ public class sensor {
     private static final java.util.List<String> DEVICE_ORDER = new java.util.ArrayList<>();
     private static final String DEFAULT_DEVICE_ID;
     private static final String GATEWAY_HOST = "gateway";
+    private static final String DEVICE_HOSTNAME;
+    static {
+        String h = "sensor_semaforo";
+        try { h = InetAddress.getLocalHost().getHostName(); } catch (Exception ignored) {}
+        DEVICE_HOSTNAME = h;
+    }
     
     // Portas segregadas para multiplexação espacial UDP
     private static final int GATEWAY_TELEMETRY_PORT = 5000;
@@ -129,12 +135,13 @@ public class sensor {
                 socket.send(new DatagramPacket(buf, buf.length, gateway, port));
                 return true;
             } catch (Exception e) {
-                if (attempt == UDP_MAX_RETRIES - 1 || !waitBeforeRetry(channel, attempt, e)) {
+                if (!waitBeforeRetry(channel, attempt, e)) {
                     System.err.println("[Java:Erro] UDP " + channel + " descartado após retries: " + e.getMessage());
                     return false;
                 }
             }
         }
+        System.err.println("[Java:Erro] UDP " + channel + " descartado após retries");
         return false;
     }
 
@@ -153,7 +160,7 @@ public class sensor {
             Messages.DiscoveryResponse disc = Messages.DiscoveryResponse.newBuilder()
                 .setDeviceId(device.deviceId)
                 .setType(Messages.DeviceType.DEVICE_TYPE_TRAFFIC_LIGHT)
-                .setIpAddress("sensor_java")
+                .setIpAddress(DEVICE_HOSTNAME)
                 .setControlPort(CONTROL_TCP_PORT)
                 .setIsControllable(true)
                 .setInitialStatus(Messages.DeviceStatus.forNumber(device.currentStatus))

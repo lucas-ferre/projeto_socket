@@ -143,24 +143,22 @@ local function send_discovery_response(target_device_id)
     for _, device_id in ipairs(ids) do
         local device = devices[device_id]
         if device then
-    local msg = {
-        device_id = device.device_id,
-        type = "DEVICE_TYPE_LAMP_POST",
-        ip_address = "sensor_posto", -- Endereçamento atrelado à rede bridge do Docker Compose
-        control_port = CONTROL_PORT,
-        initial_status = device.status,
-        is_controllable = true
-    }
-    local bytes = assert(pb.encode("smartcity.DiscoveryResponse", msg))
-    
-    -- Injeção estrita no pipeline de descoberta (Porta 5002)
-    local ok, err = send_udp_with_retry(bytes, get_gateway_ip(), GATEWAY_DISCOVERY_PORT, "Descoberta")
-    if ok then
-        print(string.format("[Sensor Lua:Descoberta] Dispositivo=%s | Setor=%s | Status=%s | Vetor topológico despachado via porta %d.",
-              device.device_id, device.sector, device.status, GATEWAY_DISCOVERY_PORT))
-    else
-        print(string.format("[Sensor Lua:Erro] Descoberta descartada após retries: %s", err))
-    end
+            local msg = {
+                device_id = device.device_id,
+                type = "DEVICE_TYPE_LAMP_POST",
+                ip_address = "sensor_posto",
+                control_port = CONTROL_PORT,
+                initial_status = device.status,
+                is_controllable = true
+            }
+            local bytes = assert(pb.encode("smartcity.DiscoveryResponse", msg))
+            local ok, err = send_udp_with_retry(bytes, get_gateway_ip(), GATEWAY_DISCOVERY_PORT, "Descoberta")
+            if ok then
+                print(string.format("[Sensor Lua:Descoberta] Dispositivo=%s | Setor=%s | Status=%s | Vetor topológico despachado via porta %d.",
+                      device.device_id, device.sector, device.status, GATEWAY_DISCOVERY_PORT))
+            else
+                print(string.format("[Sensor Lua:Erro] Descoberta descartada após retries: %s", err))
+            end
         end
     end
 end

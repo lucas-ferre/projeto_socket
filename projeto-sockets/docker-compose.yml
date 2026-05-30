@@ -5,11 +5,16 @@ services:
   gateway:
     build:
       context: .
-      dockerfile: ./gateway/Dockerfile
+      dockerfile: gateway/Dockerfile
+      args:
+        TARGET_SERVICE: gateway
     container_name: gateway
     ports:
       - "5000:5000/udp"  # Ingestão de telemetria contínua
       - "5001:5001/tcp"  # Interface de streaming analítico e atuação
+      - "5002:5002/udp"  # Registro de descoberta de sensores externos
+    volumes:
+      - gateway_db:/app/db
     networks:
       - smart_city_net
     restart: always
@@ -30,7 +35,9 @@ services:
   sensor_clima:
     build:
       context: .
-      dockerfile: ./sensor_c/Dockerfile
+      dockerfile: sensor_c/Dockerfile
+      args:
+        TARGET_SERVICE: sensor_clima
     container_name: sensor_clima
     # Condiciona a inicialização à integridade atestada do coordenador
     depends_on:
@@ -46,7 +53,9 @@ services:
   sensor_posto:
     build:
       context: .
-      dockerfile: ./sensor_lua/Dockerfile
+      dockerfile: sensor_lua/Dockerfile
+      args:
+        TARGET_SERVICE: sensor_posto
     container_name: sensor_posto
     # Garante que o nó só despache a descoberta quando o Gateway puder ouvir
     depends_on:
@@ -60,16 +69,18 @@ services:
   # 4. SEMAFORO (NÓ JAVA - CONTÍNUO)
   # ==================================================================
   sensor_java:
-      build:
-        context: .
-        dockerfile: ./sensor_java/Dockerfile
-      container_name: sensor_semaforo
-      depends_on:
-        gateway:
-          condition: service_healthy
-      networks:
-        - smart_city_net
-      restart: on-failure
+    build:
+      context: .
+      dockerfile: sensor_java/Dockerfile
+      args:
+        TARGET_SERVICE: sensor_java
+    container_name: sensor_semaforo
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks:
+      - smart_city_net
+    restart: on-failure
 
   # ==================================================================
   # 5. CÂMERA DE TRÁFEGO (NÓ PYTHON - CONTROLÁVEL)
@@ -77,14 +88,18 @@ services:
   sensor_camera:
     build:
       context: .
-      dockerfile: ./sensor_python/Dockerfile
+      dockerfile: sensor_python/Dockerfile
+      args:
+        TARGET_SERVICE: sensor_camera
     container_name: sensor_camera
+    environment:
+      - PYTHONUNBUFFERED=1  # Força flush imediato do stdout/stderr (comportamento equivalente aos sensores C, Lua e Java)
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
-    restart: on-failure   
+    restart: on-failure
 
   # ==================================================================
   # 6. CLIENTE ANALÍTICO (DASHBOARD STREAMLIT)
@@ -92,7 +107,9 @@ services:
   dashboard:
     build:
       context: .
-      dockerfile: ./client/Dockerfile
+      dockerfile: client/Dockerfile
+      args:
+        TARGET_SERVICE: dashboard
     container_name: dashboard
     ports:
       - "8501:8501" # Interface visual exposta
@@ -105,3 +122,6 @@ services:
 networks:
   smart_city_net:
     driver: bridge
+
+volumes:
+  gateway_db:

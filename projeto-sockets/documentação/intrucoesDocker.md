@@ -72,6 +72,12 @@ podman compose version
 
 No Windows, se `podman --version` não for reconhecido logo após a instalação, abra um novo terminal ou adicione `C:\Program Files\RedHat\Podman` ao PATH.
 
+O projeto também possui um helper para PowerShell que localiza o Podman no caminho padrão do Windows:
+
+```powershell
+.\scripts\podman-compose.ps1 up --build
+```
+
 Algumas instalações expõem o Compose como binário separado:
 
 ```bash
@@ -86,6 +92,8 @@ No PowerShell, a configuração temporária do provider pode ser feita assim:
 $env:PODMAN_COMPOSE_PROVIDER = "podman-compose"
 podman compose version
 ```
+
+O projeto mantém um `Dockerfile` na raiz como fallback multi-stage para o Podman Compose no Windows. Ele é usado quando o provider ignora os caminhos `build.dockerfile` do `docker-compose.yml` e tenta construir todos os serviços a partir da raiz do projeto.
 
 Neste guia, qualquer comando `docker compose` pode ser substituído por `podman compose` ou `podman-compose`, desde que o provider escolhido esteja configurado corretamente.
 
@@ -131,7 +139,7 @@ Primeiramente, abra o terminal na pasta raiz do projeto.
 Exemplo:
 
 ```bash
-cd smart-city-system
+cd projeto-sockets
 ```
 
 ---
