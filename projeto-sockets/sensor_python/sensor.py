@@ -33,6 +33,10 @@ BASE_RETRY_DELAY_SECS = 0.2
 MAX_RETRY_DELAY_SECS = 1.5
 TELEMETRY_JITTER_SECS = 0.35
 MANUAL_OVERRIDE_SECS = 30.0
+THRESHOLD_SCAN_INTERVAL_SECS = 1.0
+THRESHOLD_EVENT_COOLDOWN_SECS = 3.0
+TRAFFIC_VEHICLES_THRESHOLD = int(os.getenv("TRAFFIC_VEHICLES_THRESHOLD", "80"))
+TRAFFIC_INFRACTIONS_THRESHOLD = int(os.getenv("TRAFFIC_INFRACTIONS_THRESHOLD", "3"))
 
 shutdown_event = threading.Event()
 state_lock = threading.Lock()
@@ -42,13 +46,16 @@ def build_device_fleet(count: int) -> dict[str, dict]:
     devices = {}
     for idx in range(count):
         sector_name, sector_slug = SECTORS[idx % len(SECTORS)]
-        device_id = f"camera_{sector_slug}_{uuid.uuid4().hex[:4]}"
+        sector_ordinal = (idx // len(SECTORS)) + 1
+        device_id = f"camera_{sector_slug}_{sector_ordinal:02d}"
         devices[device_id] = {
             "device_id": device_id,
             "sector": sector_name,
             "status": messages_pb2.STATUS_ON,
             "frequency_secs": 5,
             "next_send_at": 0.0,
+            "next_threshold_check_at": 0.0,
+            "last_threshold_send_at": 0.0,
             "manual_until": 0.0,
         }
     return devices
@@ -162,6 +169,21 @@ def build_traffic_metrics() -> list[messages_pb2.Metric]:
     ]
 
 
+def traffic_threshold_reason(metrics: list[messages_pb2.Metric]) -> str | None:
+    metric_map = {metric.name: metric.value for metric in metrics}
+    reasons = []
+
+    vehicles_count = metric_map.get("vehicles_count", 0.0)
+    infractions = metric_map.get("infractions", 0.0)
+
+    if vehicles_count >= TRAFFIC_VEHICLES_THRESHOLD:
+        reasons.append(f"vehicles_count={vehicles_count:.0f} >= {TRAFFIC_VEHICLES_THRESHOLD}")
+    if infractions >= TRAFFIC_INFRACTIONS_THRESHOLD:
+        reasons.append(f"infractions={infractions:.0f} >= {TRAFFIC_INFRACTIONS_THRESHOLD}")
+
+    return "; ".join(reasons) if reasons else None
+
+
 def prepare_device_for_telemetry(device_id: str) -> tuple[str, str, int] | None:
     now = time.monotonic()
 
@@ -177,31 +199,32 @@ def prepare_device_for_telemetry(device_id: str) -> tuple[str, str, int] | None:
         return device["device_id"], device["sector"], device["status"]
 
 
-def send_telemetry_payload(device_id: str) -> None:
-    snapshot = prepare_device_for_telemetry(device_id)
-    if snapshot is None:
-        return
-
-    current_device_id, sector, current_status = snapshot
+def emit_telemetry_payload(
+    current_device_id: str,
+    sector: str,
+    current_status: int,
+    metrics: list[messages_pb2.Metric],
+    trigger_reason: str | None = None,
+) -> None:
     payload = messages_pb2.DataPayload(
         message_id=f"{current_device_id}-{int(time.time())}-{uuid.uuid4().hex[:6]}",
         timestamp=int(time.time()),
         device_id=current_device_id,
         current_status=current_status,
     )
-
-    if current_status == messages_pb2.STATUS_ON:
-        payload.metrics.extend(build_traffic_metrics())
+    payload.metrics.extend(metrics)
 
     try:
         send_udp_message(payload, GATEWAY_TELEMETRY_PORT)
         if payload.metrics:
             vehicles = payload.metrics[0].value
             infractions = payload.metrics[1].value
+            event_label = "Evento por limiar" if trigger_reason else "Telemetria injetada"
             print(
-                f"[sensor_camera] | [Sensor Python:UDP] Telemetria injetada | "
+                f"[sensor_camera] | [Sensor Python:UDP] {event_label} | "
                 f"Dispositivo={current_device_id} | Setor={sector} | Status={status_name(current_status)} | "
                 f"Veiculos={vehicles:.0f}/min | Infracoes={infractions:.0f}"
+                + (f" | Limiar={trigger_reason}" if trigger_reason else "")
             )
         else:
             print(
@@ -210,6 +233,51 @@ def send_telemetry_payload(device_id: str) -> None:
             )
     except OSError as exc:
         print(f"[sensor_camera] | [Sensor Python:Erro] Falha ao enviar telemetria de {current_device_id}: {exc}")
+
+
+def send_telemetry_payload(device_id: str) -> None:
+    snapshot = prepare_device_for_telemetry(device_id)
+    if snapshot is None:
+        return
+
+    current_device_id, sector, current_status = snapshot
+    metrics = build_traffic_metrics() if current_status == messages_pb2.STATUS_ON else []
+    emit_telemetry_payload(current_device_id, sector, current_status, metrics)
+
+
+def send_threshold_telemetry_payload(device_id: str) -> None:
+    now = time.monotonic()
+    with state_lock:
+        device = DEVICES.get(device_id)
+        if not device or now < device["next_threshold_check_at"]:
+            return
+
+        device["next_threshold_check_at"] = now + THRESHOLD_SCAN_INTERVAL_SECS
+        if (
+            device["status"] != messages_pb2.STATUS_ON
+            or now - device["last_threshold_send_at"] < THRESHOLD_EVENT_COOLDOWN_SECS
+        ):
+            return
+
+        current_device_id = device["device_id"]
+        sector = device["sector"]
+        current_status = device["status"]
+
+    metrics = build_traffic_metrics()
+    trigger_reason = traffic_threshold_reason(metrics)
+    if trigger_reason is None:
+        return
+
+    with state_lock:
+        device = DEVICES.get(device_id)
+        if not device or device["status"] != messages_pb2.STATUS_ON:
+            return
+        current_now = time.monotonic()
+        if current_now - device["last_threshold_send_at"] < THRESHOLD_EVENT_COOLDOWN_SECS:
+            return
+        device["last_threshold_send_at"] = current_now
+
+    emit_telemetry_payload(current_device_id, sector, current_status, metrics, trigger_reason)
 
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -364,6 +432,16 @@ def due_device_ids() -> list[str]:
         ]
 
 
+def threshold_due_device_ids() -> list[str]:
+    now = time.monotonic()
+    with state_lock:
+        return [
+            device_id
+            for device_id, device in DEVICES.items()
+            if now >= device["next_threshold_check_at"]
+        ]
+
+
 def main() -> None:
     random.seed(time.time_ns())
 
@@ -383,6 +461,9 @@ def main() -> None:
     send_discovery_response()
 
     while not shutdown_event.is_set():
+        for device_id in threshold_due_device_ids():
+            send_threshold_telemetry_payload(device_id)
+
         for device_id in due_device_ids():
             send_telemetry_payload(device_id)
 

@@ -211,30 +211,41 @@ Configure no `docker-compose.yml` sob a chave `environment:` de cada serviço.
 |----------|--------|-----------|
 | `DISCOVERY_PROBE_INTERVAL_SECS` | `15` | Intervalo dos probes multicast que pedem aos sensores para reanunciar a topologia |
 | `MULTICAST_TTL` | `1` | TTL dos pacotes multicast de recuperação |
+| `DEVICE_OFFLINE_TIMEOUT_SECS` | `45` | Tempo máximo sem `last_seen` antes de marcar o dispositivo como offline |
+| `DEVICE_OFFLINE_CHECK_INTERVAL_SECS` | `5` | Intervalo da varredura de presença no SQLite |
+| `TCP_CLIENT_READ_TIMEOUT` | `10` | Timeout para ler cabeçalho/payload de um frame TCP já iniciado |
+| `TCP_CLIENT_IDLE_TIMEOUT` | `60` | Tempo que uma conexão TCP persistente pode ficar ociosa antes de ser fechada |
+| `TCP_MAX_FRAME_BYTES` | `1048576` | Tamanho máximo aceito para frames TCP do cliente |
+| `DB_POOL_SIZE` | `4` | Tamanho do pool de conexões SQLite |
+
+### sensor_clima (C)
+
+| Variável | Padrão | Descrição |
+|----------|--------|-----------|
+| `C_DEVICE_COUNT` | `3` | Número de estações ambientais simuladas |
 
 ### sensor_posto (Lua)
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
 | `LUA_DEVICE_COUNT` | `3` | Número de postes simulados |
+| `LUMINOSITY_LOW_THRESHOLD` | `80` | Limiar inferior que dispara evento imediato de luminosidade |
+| `POWER_CONSUMPTION_THRESHOLD` | `32` | Limiar superior que dispara evento imediato de consumo |
 
 ### sensor_semaforo (Java)
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
 | `JAVA_DEVICE_COUNT` | `3` | Número de semáforos simulados |
+| `TRAFFIC_QUEUE_THRESHOLD` | `35` | Limiar de fila veicular que dispara evento imediato |
 
 ### sensor_camera (Python)
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
 | `CAMERA_DEVICE_COUNT` | `3` | Número de câmeras simuladas |
-
-### gateway
-
-| Variável | Padrão | Descrição |
-|----------|--------|-----------|
-| `DB_POOL_SIZE` | `4` | Tamanho do pool de conexões SQLite |
+| `TRAFFIC_VEHICLES_THRESHOLD` | `80` | Limiar de veículos por minuto que dispara evento imediato |
+| `TRAFFIC_INFRACTIONS_THRESHOLD` | `3` | Limiar de infrações que dispara evento imediato |
 
 ---
 
@@ -274,6 +285,7 @@ Simula 3 semáforos com ciclo operacional configurável.
 | Métrica | Unidade | Valor | Descrição |
 |---------|---------|-------|-----------|
 | `state` | code | `1` | Estado do ciclo (emitido apenas quando STATUS_ON) |
+| `queue_length` | vehicles | 5 – 50 | Fila simulada no cruzamento, usada para disparo por limiar |
 
 ### Sensor Câmera — sensor_camera (Python)
 
@@ -337,7 +349,7 @@ sensor_camera:
 ```
 
 Cada dispositivo da frota:
-- Recebe `device_id` único com sufixo hex aleatório (ex.: `camera_pici_a3f1`)
+- Recebe `device_id` estável por tipo/setor/ordinal (ex.: `camera_pici_01`)
 - Mantém estado independente (status, frequência de envio)
 - É registrado individualmente no Gateway
 - Pode ser controlado individualmente pelo dashboard
@@ -384,7 +396,7 @@ O processamento estatístico ocorre inteiramente no gateway. O cliente recebe ap
 | Desvio Padrão | `OP_STD_DEV` | Dispersão em relação à média |
 
 Parâmetros:
-- **Métrica alvo** — 11 disponíveis (ver catálogo acima)
+- **Métrica alvo** — 12 disponíveis (ver catálogo acima)
 - **Janela temporal** — últimas 1 a 24 horas
 
 ---
@@ -409,6 +421,21 @@ Todos os sensores escutam o grupo e re-enviam `DiscoveryResponse`, garantindo re
 ### Jitter de telemetria
 
 Cada ciclo de envio inclui atraso aleatório (até ±350 ms) para evitar sincronização de envios em frotas grandes e reduzir colisões UDP.
+
+### Eventos imediatos por limiar
+
+Além do envio periódico, os sensores simulam amostras intermediárias e emitem um `DataPayload` extra quando um valor crítico cruza o limiar definido. O envio por limiar usa cooldown de 3 segundos para evitar rajadas e não altera a próxima janela periódica.
+
+| Sensor | Limiar de evento |
+|--------|------------------|
+| C / Estação ambiental | `temperature >= 32°C`, `pm25 >= 35 µg/m³` ou `aqi >= 100` |
+| Lua / Poste | `luminosity <= 80%` ou `power_consumption >= 32 W` |
+| Java / Semáforo | `queue_length >= 35 veículos` |
+| Python / Câmera | `vehicles_count >= 80` ou `infractions >= 3` |
+
+### Detecção automática de offline
+
+O gateway marca dispositivos sem pacotes recentes como `STATUS_OFF` usando `DEVICE_OFFLINE_TIMEOUT_SECS`. Como os IDs agora são estáveis, reiniciar um sensor atualiza o mesmo registro no SQLite em vez de criar uma nova chave fantasma.
 
 ### Graceful Shutdown
 

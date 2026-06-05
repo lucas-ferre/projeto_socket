@@ -4,8 +4,13 @@ import time
 import struct
 import uuid
 import datetime
+import threading
 import pandas as pd
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
+from google.protobuf.message import DecodeError
 
 # Importa as classes do Protobuf geradas no momento do build
 import messages_pb2 # pyright: ignore[reportMissingImports]
@@ -17,51 +22,244 @@ import messages_pb2 # pyright: ignore[reportMissingImports]
 GATEWAY_HOST = "gateway"
 GATEWAY_PORT = 5001
 
-def recv_all(sock, n):
-    """Função auxiliar para garantir a leitura de exatamente n bytes do buffer."""
-    data = bytearray()
-    while len(data) < n:
-        packet = sock.recv(n - len(data))
-        if not packet: return None
-        data.extend(packet)
-    return data
+# [B2/M1] TTL do cache de status do gateway (segundos)
+# Evita probe TCP bloqueante a cada rerender do Streamlit.
+_GW_STATUS_TTL = 10.0
+_TCP_CONNECT_TIMEOUT = 2.0
+_TCP_IO_TIMEOUT = 5.0
+_MAX_TCP_FRAME_BYTES = 1024 * 1024
+_REQUEST_WORKERS = 4
 
-def send_tcp_request(request: messages_pb2.ClientRequest) -> messages_pb2.ClientResponse:
-    """Encapsula a requisição TCP com protocolo de Framing e Timeout explícito."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            # FIX 1: Impede vazamento de conexão e travamento da UI (Timeout de 5s)
-            s.settimeout(5.0)  
-            s.connect((GATEWAY_HOST, GATEWAY_PORT))
-            
-            # 1. Envia requisição com prefixo de tamanho (Length-Prefix Framing)
-            msg_data = request.SerializeToString()
-            s.sendall(struct.pack('>I', len(msg_data)) + msg_data)
-            
-            # 2. Lê o cabeçalho da resposta (4 bytes Big-Endian)
-            header = recv_all(s, 4)
-            if not header: return None
-            resp_len = struct.unpack('>I', header)[0]
-            
-            # 3. Lê o corpo binário exato da resposta e desserializa
-            data = recv_all(s, resp_len)
-            if data:
-                response = messages_pb2.ClientResponse()
-                response.ParseFromString(data)
-                return response
-    except Exception as e:
-        st.error(f"Erro crítico no fluxo TCP/Framing: {e}")
+@dataclass
+class TcpRequestResult:
+    response: messages_pb2.ClientResponse | None = None
+    error_code: str = ""
+    error_message: str = ""
+
+    @property
+    def transport_ok(self) -> bool:
+        return self.error_code == ""
+
+
+class GatewayConnectionClosed(RuntimeError):
+    pass
+
+
+class GatewayTcpClient:
+    """Cliente TCP persistente para reduzir handshakes e classificar falhas de rede."""
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self._sock: socket.socket | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def is_busy(self) -> bool:
+        return self._lock.locked()
+
+    def close(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def _connect_locked(self) -> None:
+        if self._sock is not None:
+            return
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(_TCP_CONNECT_TIMEOUT)
+            sock.connect((self.host, self.port))
+            sock.settimeout(_TCP_IO_TIMEOUT)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self._sock = sock
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            sock.close()
+            raise
+
+    def ensure_connected(self) -> TcpRequestResult:
+        acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            return TcpRequestResult(
+                error_code="BUSY",
+                error_message="Canal TCP ocupado por outra operação em andamento.",
+            )
+
+        try:
+            try:
+                self._connect_locked()
+                return TcpRequestResult()
+            except socket.timeout:
+                self.close()
+                return TcpRequestResult(
+                    error_code="CONNECT_TIMEOUT",
+                    error_message="Timeout ao conectar ao Gateway.",
+                )
+            except ConnectionRefusedError:
+                self.close()
+                return TcpRequestResult(
+                    error_code="CONNECTION_REFUSED",
+                    error_message="Gateway recusou a conexão TCP.",
+                )
+            except OSError as exc:
+                self.close()
+                return TcpRequestResult(
+                    error_code="SOCKET_ERROR",
+                    error_message=f"Falha de socket ao conectar ao Gateway: {exc}",
+                )
+        finally:
+            self._lock.release()
+
+    def _recv_exact_locked(self, size: int) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            chunk = self._sock.recv(size - len(data))
+            if not chunk:
+                raise GatewayConnectionClosed("Gateway encerrou a conexão TCP.")
+            data.extend(chunk)
+        return bytes(data)
+
+    def request(self, request: messages_pb2.ClientRequest) -> TcpRequestResult:
+        msg_data = request.SerializeToString()
+        frame = struct.pack(">I", len(msg_data)) + msg_data
+
+        with self._lock:
+            for attempt in range(2):
+                try:
+                    self._connect_locked()
+                    self._sock.sendall(frame)
+
+                    header = self._recv_exact_locked(4)
+                    resp_len = struct.unpack(">I", header)[0]
+                    if resp_len <= 0 or resp_len > _MAX_TCP_FRAME_BYTES:
+                        self.close()
+                        return TcpRequestResult(
+                            error_code="INVALID_FRAME_SIZE",
+                            error_message=f"Gateway retornou frame inválido: {resp_len} bytes.",
+                        )
+
+                    data = self._recv_exact_locked(resp_len)
+                    response = messages_pb2.ClientResponse()
+                    response.ParseFromString(data)
+                    return TcpRequestResult(response=response)
+
+                except (GatewayConnectionClosed, ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as exc:
+                    self.close()
+                    if attempt == 0:
+                        continue
+                    return TcpRequestResult(
+                        error_code="CONNECTION_CLOSED",
+                        error_message=f"Conexão TCP encerrada durante a requisição: {exc}",
+                    )
+                except socket.timeout:
+                    self.close()
+                    return TcpRequestResult(
+                        error_code="IO_TIMEOUT",
+                        error_message="Gateway não respondeu dentro da janela de timeout do socket.",
+                    )
+                except ConnectionRefusedError:
+                    self.close()
+                    return TcpRequestResult(
+                        error_code="CONNECTION_REFUSED",
+                        error_message="Gateway recusou a conexão TCP.",
+                    )
+                except struct.error as exc:
+                    self.close()
+                    return TcpRequestResult(
+                        error_code="FRAME_HEADER_ERROR",
+                        error_message=f"Cabeçalho de frame TCP corrompido: {exc}",
+                    )
+                except DecodeError as exc:
+                    self.close()
+                    return TcpRequestResult(
+                        error_code="PROTOBUF_DECODE_ERROR",
+                        error_message=f"Resposta Protobuf inválida do Gateway: {exc}",
+                    )
+                except OSError as exc:
+                    self.close()
+                    return TcpRequestResult(
+                        error_code="SOCKET_ERROR",
+                        error_message=f"Falha de socket no fluxo TCP: {exc}",
+                    )
+
+        return TcpRequestResult(
+            error_code="REQUEST_FAILED",
+            error_message="Falha não classificada no fluxo TCP.",
+        )
+
+
+def get_gateway_client() -> GatewayTcpClient:
+    if "gateway_tcp_client" not in st.session_state:
+        st.session_state.gateway_tcp_client = GatewayTcpClient(GATEWAY_HOST, GATEWAY_PORT)
+    return st.session_state.gateway_tcp_client
+
+
+def get_request_executor() -> ThreadPoolExecutor:
+    if "tcp_request_executor" not in st.session_state:
+        st.session_state.tcp_request_executor = ThreadPoolExecutor(max_workers=_REQUEST_WORKERS)
+    return st.session_state.tcp_request_executor
+
+
+def submit_tcp_request(task_key: str, request: messages_pb2.ClientRequest, context: dict) -> None:
+    client = get_gateway_client()
+    executor = get_request_executor()
+    st.session_state[task_key] = {
+        "future": executor.submit(client.request, request),
+        "context": context,
+        "started_at": time.time(),
+    }
+
+
+def is_tcp_task_pending(task_key: str) -> bool:
+    task = st.session_state.get(task_key)
+    return bool(task and not task["future"].done())
+
+
+def consume_tcp_task(task_key: str, label: str) -> tuple[TcpRequestResult, dict] | None:
+    task = st.session_state.get(task_key)
+    if not task:
         return None
 
+    future = task["future"]
+    if not future.done():
+        elapsed = time.time() - task["started_at"]
+        st.info(f"{label} em andamento há {elapsed:.1f}s. A interface segue disponível.")
+        if st.button(f"Verificar {label}", key=f"{task_key}_poll"):
+            st.rerun()
+        return None
+
+    result = future.result()
+    context = task["context"]
+    del st.session_state[task_key]
+    return result, context
+
+
+def send_tcp_request_result(request: messages_pb2.ClientRequest) -> TcpRequestResult:
+    return get_gateway_client().request(request)
+
+
+def send_tcp_request(request: messages_pb2.ClientRequest) -> messages_pb2.ClientResponse | None:
+    """Compatibilidade para chamadas síncronas existentes, agora com erro classificado."""
+    result = send_tcp_request_result(request)
+    if result.response is not None:
+        return result.response
+
+    if result.error_message:
+        st.error(f"{result.error_code}: {result.error_message}")
+    return None
+
 def check_gateway_status() -> bool:
-    """Realiza um probe rápido (2s) para atestar a vitalidade do nó central."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2.0)
-            s.connect((GATEWAY_HOST, GATEWAY_PORT))
-            return True
-    except Exception:
-        return False
+    """Atesta a vitalidade do Gateway reaproveitando o canal TCP persistente."""
+    client = get_gateway_client()
+    if client.is_busy:
+        return st.session_state.get("gw_status", False)
+
+    result = client.ensure_connected()
+    return result.transport_ok
 
 def infer_sector_from_device_id(device_id: str) -> str:
     """Realiza análise em substring para mapear IDs heterogêneos aos setores físicos."""
@@ -107,6 +305,10 @@ def get_metric_reference_range(metric_key: str) -> dict:
         "power_consumption": {
             "safe": (0, 100), "warning": (100, 200), "critical": (200, float('inf')),
             "description": "Consumo normal: 0-100W"
+        },
+        "queue_length": {
+            "safe": (0, 20), "warning": (20, 35), "critical": (35, float('inf')),
+            "description": "Fila tolerável: até 35 veículos"
         }
     }
     return ranges.get(metric_key, {
@@ -144,14 +346,21 @@ METRIC_ICONS = {
     "temperature": "🌡️", "humidity": "💧", "co2": "🌿",
     "pm25": "🌫️", "pm10": "💨", "aqi": "🏭",
     "luminosity": "💡", "power_consumption": "⚡", "state": "🚦",
-    "vehicles_count": "🚗", "infractions": "📸",
+    "vehicles_count": "🚗", "infractions": "📸", "queue_length": "🚥",
 }
 
 METRIC_UNITS = {
     "temperature": "°C", "humidity": "%", "co2": "ppm",
     "pm25": "µg/m³", "pm10": "µg/m³", "aqi": "",
     "luminosity": "%", "power_consumption": "W", "state": "",
-    "vehicles_count": "veh/min", "infractions": "count",
+    "vehicles_count": "veh/min", "infractions": "count", "queue_length": "vehicles",
+}
+
+DEVICE_METRICS_MAP = {
+    messages_pb2.DEVICE_TYPE_WEATHER_STATION: ["temperature", "humidity", "co2", "pm25", "pm10", "aqi"],
+    messages_pb2.DEVICE_TYPE_LAMP_POST: ["luminosity", "power_consumption"],
+    messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT: ["state", "queue_length"],
+    messages_pb2.DEVICE_TYPE_CAMERA: ["vehicles_count", "infractions"],
 }
 
 # ====================================================================
@@ -168,21 +377,10 @@ st.set_page_config(
 st.title("🏙️ Centro de Controle Analítico - Smart City")
 st.markdown("Monitoramento distribuído, controle operacional e agregação estatística via Sockets TCP/Protobuf.")
 
-with st.sidebar:
-    st.subheader("📊 Status do Sistema")
-    col1, col2, col3 = st.columns(3)
-    gateway_status = "🟢 Ativo" if check_gateway_status() else "🔴 Inativo"
-    col1.metric("Gateway", gateway_status)
-    sensor_count = len(st.session_state.device_history) if 'device_history' in st.session_state else "N/A"
-    col2.metric("Sensores", sensor_count, help="Atualizar na aba Descoberta")
-    col3.metric("Hora UTC", datetime.datetime.utcnow().strftime('%H:%M:%S'))
-    st.markdown("---")
-    st.info("💡 Selecione uma aba para iniciar operações na rede.")
-
-st.divider()
-
 # ====================================================================
 # GERENCIAMENTO DE ESTADO EM MEMÓRIA
+# [B2/M1] Movido para ANTES da sidebar — garante que gw_last_check e
+# gw_status existam quando a sidebar tentar lê-los no primeiro render.
 # ====================================================================
 
 if 'device_history' not in st.session_state:
@@ -193,11 +391,43 @@ if 'last_cmd_result' not in st.session_state:
     st.session_state.last_cmd_result = None
 if 'selected_device_id' not in st.session_state:
     st.session_state.selected_device_id = None
+# [B2/M1] Cache de status do gateway com TTL
+if 'gw_last_check' not in st.session_state:
+    st.session_state.gw_last_check = 0.0
+if 'gw_status' not in st.session_state:
+    st.session_state.gw_status = False
 
-tab1, tab2, tab3 = st.tabs([
+# ====================================================================
+# SIDEBAR
+# ====================================================================
+
+with st.sidebar:
+    st.subheader("📊 Status do Sistema")
+    col1, col2, col3 = st.columns(3)
+
+    # [B2/M1] Probe TCP só executado quando o cache expirar (TTL = 10s).
+    # Antes: check_gateway_status() abria um socket a cada rerender —
+    # qualquer slider/aba bloqueava a UI por até 2s com gateway down.
+    if time.time() - st.session_state.gw_last_check > _GW_STATUS_TTL:
+        st.session_state.gw_status = check_gateway_status()
+        st.session_state.gw_last_check = time.time()
+
+    gateway_status = "🟢 Ativo" if st.session_state.gw_status else "🔴 Inativo"
+    col1.metric("Gateway", gateway_status)
+
+    sensor_count = len(st.session_state.device_history) if st.session_state.device_history else "N/A"
+    col2.metric("Sensores", sensor_count, help="Atualizar na aba Descoberta")
+    col3.metric("Hora UTC", datetime.datetime.utcnow().strftime('%H:%M:%S'))
+    st.markdown("---")
+    st.info("💡 Selecione uma aba para iniciar operações na rede.")
+
+st.divider()
+
+tab1, tab2, tab3, tab4 = st.tabs([
     "📡 Fontes de Dados (Descoberta)", 
     "⚙️ Painel de Atuação (Controle)", 
-    "📊 Consultas Analíticas (OLAP)"
+    "📊 Consultas Analíticas (OLAP)",
+    "🔍 Inspeção Individual (Sensor)"
 ])
 
 # --------------------------------------------------------------------
@@ -216,7 +446,10 @@ with tab1:
                 resp = send_tcp_request(req)
                 
             if resp and resp.success:
-                st.session_state.device_history = resp.devices
+                # [B3] list() materializa o RepeatedCompositeContainer em lista Python
+                # independente. Sem isso, device_history aponta para o container filho
+                # de resp — se resp for coletado pelo GC, os objetos ficam inválidos.
+                st.session_state.device_history = list(resp.devices)
                 if not resp.devices:
                     st.info("✓ Nenhum dispositivo descoberto pelo Gateway até o momento.")
                 else:
@@ -282,10 +515,15 @@ with tab2:
             if st.session_state.selected_device_id not in device_ids and device_ids:
                 st.session_state.selected_device_id = device_ids[0]
             
+            # [R7] Parâmetro index= removido — conflitava silenciosamente com key=.
+            # Quando key= está presente, o Streamlit usa session_state[key] como
+            # valor do widget; index= é ignorado após o primeiro render e pode
+            # divergir do estado real em edge cases de reordenação da lista.
+            # O guard acima (selected_device_id not in device_ids) já garante
+            # que session_state contém sempre um valor válido antes do widget renderizar.
             target_id = st.selectbox(
                 "Selecione o Nó Alvo de Atuação", 
                 options=device_ids,
-                index=device_ids.index(st.session_state.selected_device_id) if st.session_state.selected_device_id in device_ids else 0,
                 key="selected_device_id"
             )
             
@@ -310,6 +548,7 @@ with tab2:
                     if res_type == "success": st.success(f"**Confirmação Positiva:** {msg}")
                     elif res_type == "error": st.error(f"**Falha de I/O:** {msg}")
                     elif res_type == "warning": st.warning(f"⚠️ {msg}")
+                    elif res_type == "info": st.info(msg)
                 with c_clr:
                     if st.button("✕", key="clear_msg"):
                         st.session_state.last_cmd_result = None
@@ -340,9 +579,57 @@ with tab2:
                                       disabled=not alterar_freq)
 
             st.markdown("---")
+
+            completed_command = consume_tcp_task("command_task", "Comando TCP")
+            if completed_command:
+                result, context = completed_command
+                resp = result.response
+                ts = datetime.datetime.now().strftime('%H:%M:%S')
+
+                if resp:
+                    st.session_state.command_history.append({
+                        "timestamp": ts,
+                        "device": context["target_id"],
+                        "command_id": context["command_id"],
+                        "status": "✓ Aprovado" if resp.success else "✗ Recusado",
+                        "message": resp.message,
+                    })
+
+                    if resp.success:
+                        # Reconciliação do estado no buffer da UI para não exigir novo "Atualizar Topologia"
+                        for device in st.session_state.device_history:
+                            if device.device_id == context["target_id"]:
+                                if context["update_status"]:
+                                    device.status = context["target_status"]
+                                device.last_seen_timestamp = int(time.time())
+                                break
+
+                        st.session_state.last_cmd_result = {"type": "success", "message": resp.message}
+                    else:
+                        st.session_state.last_cmd_result = {"type": "error", "message": resp.message}
+                else:
+                    st.session_state.command_history.append({
+                        "timestamp": ts,
+                        "device": context["target_id"],
+                        "command_id": context["command_id"],
+                        "status": f"⚠️ {result.error_code}",
+                        "message": result.error_message,
+                    })
+                    st.session_state.last_cmd_result = {
+                        "type": "error",
+                        "message": result.error_message,
+                    }
+
+                st.rerun()
             
             # Submissão direta e avaliação reativa dos valores correntes no dashboard
-            if st.button("Transmitir Payload de Controle (TCP)", type="primary", use_container_width=True):
+            command_pending = is_tcp_task_pending("command_task")
+            if st.button(
+                "Transmitir Payload de Controle (TCP)",
+                type="primary",
+                use_container_width=True,
+                disabled=command_pending,
+            ):
                 if not alterar_status and not alterar_freq:
                     st.session_state.last_cmd_result = {"type": "warning", "message": "Nenhum parâmetro selecionado para sobreposição."}
                     st.rerun()
@@ -366,34 +653,23 @@ with tab2:
                     if alterar_freq:
                         cmd.update_frequency = True
                         cmd.new_frequency_secs = int(nova_freq)
-                    
-                    with st.spinner(f"Bloqueando para I/O: Enviando frame ao Gateway e aguardando ACK do sensor..."):
-                        resp = send_tcp_request(req)
-                        
-                    if resp:
-                        ts = datetime.datetime.now().strftime('%H:%M:%S')
-                        st.session_state.command_history.append({
-                            "timestamp": ts,
-                            "device": target_id,
+
+                    submit_tcp_request(
+                        "command_task",
+                        req,
+                        {
+                            "target_id": target_id,
                             "command_id": cmd.command_id,
-                            "status": "✓ Aprovado" if resp.success else "✗ Recusado",
-                            "message": resp.message
-                        })
-                        
-                        if resp.success:
-                            # Reconciliação do estado no buffer da UI para não exigir novo "Atualizar Topologia"
-                            for device in st.session_state.device_history:
-                                if device.device_id == target_id:
-                                    if cmd.update_status:
-                                        device.status = cmd.target_status
-                                    device.last_seen_timestamp = int(time.time())
-                                    break
-                            
-                            st.session_state.last_cmd_result = {"type": "success", "message": resp.message}
-                            st.rerun()
-                        else:
-                            st.session_state.last_cmd_result = {"type": "error", "message": resp.message}
-                            st.rerun()
+                            "update_status": bool(cmd.update_status),
+                            "target_status": cmd.target_status,
+                        },
+                    )
+                    st.session_state.last_cmd_result = {
+                        "type": "info",
+                        "message": "Comando enviado em segundo plano; aguardando ACK do Gateway.",
+                    }
+
+                    st.rerun()
             
             st.divider()
             st.subheader("📜 Auditoria de Atuação Recente")
@@ -401,7 +677,7 @@ with tab2:
             if st.session_state.command_history:
                 history_df = pd.DataFrame(st.session_state.command_history[-10:])
                 history_df = history_df[['timestamp', 'device', 'command_id', 'status', 'message']]
-                history_df.columns = ['Ocorrência', 'Endereço Lógico', 'Hash do Comando', '✓ Resultado', 'Retorno I/O']
+                history_df.columns = ['Ocorrência', 'Endereço Lógico', 'Hash do Comando', 'Status Execução', 'Retorno I/O']
                 st.dataframe(history_df.iloc[::-1], use_container_width=True, hide_index=True)
             else:
                 st.info("📋 Tabela de auditoria vazia. Os comandos executados nesta sessão aparecerão aqui.")
@@ -433,6 +709,7 @@ with tab3:
             ("⚡ Drenagem Energética (W)",       "power_consumption"),
             ("🚗 Fluxo Veicular Direto",         "vehicles_count"),
             ("📸 Taxa de Infrações Corrente",    "infractions"),
+            ("🚥 Fila Semafórica (veículos)",    "queue_length"),
         ], format_func=lambda x: x[0])
         
     with c_time:
@@ -535,10 +812,148 @@ with tab3:
         |--------|----------|
         | 🌡️ Estação Ambiental (C) | `temperature` · `humidity` · `co2` · `pm25` · `pm10` · `aqi` |
         | 💡 Poste Inteligente (Lua) | `luminosity` · `power_consumption` |
-        | 🚦 Semáforo (Java) | `state` |
+        | 🚦 Semáforo (Java) | `state` · `queue_length` |
         | 📹 Câmera de Tráfego (Python) | `vehicles_count` · `infractions` |
 
         **Referência de qualidade do ar (AQI — EPA):**
         `0–50` Bom · `51–100` Moderado · `101–150` Insalubre (sensíveis) ·
         `151–200` Insalubre · `201–300` Muito insalubre · `>300` Perigoso
         """)
+
+# --------------------------------------------------------------------
+# ABA 4: Inspeção Individual (Diagnóstico Local Vetorizado)
+# --------------------------------------------------------------------
+with tab4:
+    st.subheader("🔍 Inspeção Individual e Diagnóstico de Telemetria")
+
+    if not st.session_state.device_history:
+        st.info("Topologia desconhecida. Sincronize a rede na aba 'Fontes de Dados'.")
+    else:
+        all_devices = st.session_state.device_history
+        device_lookup = {d.device_id: d for d in all_devices}
+
+        c_dev, c_metric, c_time = st.columns([2, 2, 1])
+
+        with c_dev:
+            target_inspec_id = st.selectbox(
+                "Nó Analisado",
+                options=list(device_lookup.keys()),
+                key="tab4_selected_device_id",
+            )
+
+        selected_inspec_device = device_lookup[target_inspec_id]
+        available_metrics = DEVICE_METRICS_MAP.get(selected_inspec_device.type, ["state"])
+
+        with c_metric:
+            metrica_inspec_alvo = st.selectbox(
+                "Métrica Operacional",
+                options=available_metrics,
+                format_func=lambda x: f"{METRIC_ICONS.get(x, '📊')} {x.replace('_', ' ').title()}",
+            )
+
+        with c_time:
+            janela_inspec = st.slider(
+                "Janela (Horas)",
+                min_value=1,
+                max_value=24,
+                value=1,
+                key="tab4_slider",
+            )
+
+        if st.button("Executar Varredura do Sensor", type="primary", use_container_width=True):
+            req = messages_pb2.ClientRequest()
+            req.type = messages_pb2.REQUEST_TYPE_ANALYTICS_QUERY
+            req.query_op = messages_pb2.OP_AVERAGE
+            req.query_metric = metrica_inspec_alvo
+
+            agora = int(time.time())
+            req.end_timestamp = agora
+            req.start_timestamp = agora - (janela_inspec * 3600)
+
+            with st.spinner(f"Filtrando matriz de dados para {target_inspec_id}..."):
+                resp = send_tcp_request(req)
+
+            if resp and resp.success:
+                filtered_points = [
+                    pt for pt in resp.graph_points
+                    if pt.device_id == target_inspec_id
+                ]
+
+                if not filtered_points:
+                    st.warning(
+                        f"Não há pontos de `{metrica_inspec_alvo}` emitidos por "
+                        f"`{target_inspec_id}` na janela solicitada."
+                    )
+                else:
+                    df_inspec = pd.DataFrame([
+                        {"timestamp": pt.timestamp, "value": pt.value}
+                        for pt in filtered_points
+                    ]).sort_values(by="timestamp").reset_index(drop=True)
+
+                    df_inspec["delta_t"] = df_inspec["timestamp"].diff()
+                    mean_interval = df_inspec["delta_t"].mean()
+                    same_second_samples = int((df_inspec["delta_t"] == 0.0).sum())
+                    same_second_rate = (
+                        (same_second_samples / len(df_inspec)) * 100
+                        if len(df_inspec) > 0 else 0.0
+                    )
+
+                    st.divider()
+                    st.markdown(f"### Saúde Operacional: `{target_inspec_id}`")
+
+                    col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
+                    col_kpi1.metric("Amostras Extraídas", len(df_inspec))
+
+                    interval_label = (
+                        "Amostra insuficiente"
+                        if pd.isna(mean_interval)
+                        else f"{mean_interval:.2f}s"
+                    )
+                    col_kpi2.metric(
+                        "Intervalo Médio Entre Amostras",
+                        interval_label,
+                        help="Média do intervalo entre timestamps consecutivos enviados pelo sensor.",
+                    )
+                    col_kpi3.metric(
+                        "Amostras no Mesmo Segundo",
+                        f"{same_second_rate:.1f}%",
+                        f"{same_second_samples} ocorrência(s)",
+                        delta_color="off",
+                        help=(
+                            "Timestamps iguais podem indicar rajada, retry ou envio imediato por limiar; "
+                            "não significam duplicata Protobuf por si só."
+                        ),
+                    )
+
+                    st.markdown("---")
+                    col_graph, col_table = st.columns([2, 1])
+
+                    with col_graph:
+                        st.write(f"#### Comportamento do Sinal: **{metrica_inspec_alvo}**")
+                        df_inspec["Horário"] = pd.to_datetime(
+                            df_inspec["timestamp"], unit="s"
+                        ).dt.strftime("%H:%M:%S")
+                        st.line_chart(
+                            df_inspec.set_index("Horário")["value"],
+                            use_container_width=True,
+                            height=350,
+                        )
+
+                    with col_table:
+                        unit = METRIC_UNITS.get(metrica_inspec_alvo, "")
+                        value_label = (
+                            f"Medição ({unit})" if unit else "Medição"
+                        )
+                        st.write("#### Registros do Sensor")
+                        st.dataframe(
+                            df_inspec[["Horário", "value"]].rename(
+                                columns={"value": value_label}
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+            elif resp:
+                st.error(f"Falha na extração de dados do nó: {resp.message}")
+            else:
+                st.error("Ruptura de canal TCP ao solicitar vetor de telemetria isolado.")

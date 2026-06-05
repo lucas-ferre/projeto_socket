@@ -24,7 +24,18 @@ public class sensor {
         try { h = InetAddress.getLocalHost().getHostName(); } catch (Exception ignored) {}
         DEVICE_HOSTNAME = h;
     }
-    
+
+    private static final DatagramSocket DISC_SOCKET;
+    static {
+        try {
+            DISC_SOCKET = new DatagramSocket();
+        } catch (SocketException e) {
+            throw new ExceptionInInitializerError(
+                "Falha ao criar socket UDP de descoberta: " + e.getMessage()
+            );
+        }
+    }
+
     // Portas segregadas para multiplexação espacial UDP
     private static final int GATEWAY_TELEMETRY_PORT = 5000;
     private static final int GATEWAY_DISCOVERY_PORT = 5002;
@@ -38,6 +49,11 @@ public class sensor {
     private static final long TELEMETRY_JITTER_MS = 350L;
     private static final int MAX_TCP_FRAME_BYTES = 1024 * 1024;
     private static final long MANUAL_OVERRIDE_MS = 30_000L;
+    private static final long THRESHOLD_SCAN_INTERVAL_MS = 1_000L;
+    private static final long THRESHOLD_EVENT_COOLDOWN_MS = 3_000L;
+    private static final int TRAFFIC_QUEUE_THRESHOLD = Integer.parseInt(
+        System.getenv().getOrDefault("TRAFFIC_QUEUE_THRESHOLD", "35")
+    );
 
     private static class DeviceState {
         final String deviceId;
@@ -45,6 +61,8 @@ public class sensor {
         volatile int currentStatus = Messages.DeviceStatus.STATUS_ON_VALUE;
         volatile int frequencySecs = 5;
         volatile long nextSendAtMillis = 0L;
+        volatile long nextThresholdCheckAtMillis = 0L;
+        volatile long lastThresholdSendAtMillis = 0L;
         volatile long manualUntilMillis = 0L;
 
         DeviceState(String deviceId, String sector) {
@@ -56,8 +74,9 @@ public class sensor {
     static {
         for (int i = 0; i < DEVICE_COUNT; i++) {
             int sectorIdx = i % SECTORS.length;
+            int sectorOrdinal = (i / SECTORS.length) + 1;
             String deviceId = "semaforo_" + SECTORS[sectorIdx][1] + "_"
-                + java.util.UUID.randomUUID().toString().substring(0, 4);
+                + String.format("%02d", sectorOrdinal);
             DeviceState device = new DeviceState(deviceId, SECTORS[sectorIdx][0]);
             DEVICES.put(deviceId, device);
             DEVICE_ORDER.add(deviceId);
@@ -114,6 +133,17 @@ public class sensor {
         return Messages.DeviceStatus.STATUS_ERROR_VALUE;
     }
 
+    private static int sampleQueueLength() {
+        return 5 + RNG.nextInt(46);
+    }
+
+    private static String queueThresholdReason(int queueLength) {
+        if (queueLength >= TRAFFIC_QUEUE_THRESHOLD) {
+            return "queue_length=" + queueLength + " >= " + TRAFFIC_QUEUE_THRESHOLD;
+        }
+        return null;
+    }
+
     private static boolean waitBeforeRetry(String channel, int attempt, Exception e) {
         long delay = retryDelayMillis(attempt);
         System.err.println("[Java:Retry] UDP " + channel + " falhou (tentativa "
@@ -156,7 +186,8 @@ public class sensor {
         DeviceState device = DEVICES.get(deviceId);
         if (device == null) return;
 
-        try (DatagramSocket socket = new DatagramSocket()) {
+        // [M4] Reutiliza DISC_SOCKET estático — sem criação/destruição de socket por chamada
+        try {
             Messages.DiscoveryResponse disc = Messages.DiscoveryResponse.newBuilder()
                 .setDeviceId(device.deviceId)
                 .setType(Messages.DeviceType.DEVICE_TYPE_TRAFFIC_LIGHT)
@@ -165,17 +196,17 @@ public class sensor {
                 .setIsControllable(true)
                 .setInitialStatus(Messages.DeviceStatus.forNumber(device.currentStatus))
                 .build();
-            
+
             byte[] buf = disc.toByteArray();
-            
+
             // Roteamento exclusivo para o pipeline de Descoberta
-            if (sendUdpWithRetry(socket, buf, GATEWAY_DISCOVERY_PORT, "Descoberta")) {
+            if (sendUdpWithRetry(DISC_SOCKET, buf, GATEWAY_DISCOVERY_PORT, "Descoberta")) {
                 System.out.println("[Java:Descoberta] Dispositivo=" + device.deviceId
                     + " | Setor=" + device.sector
                     + " | Status=" + Messages.DeviceStatus.forNumber(device.currentStatus)
                     + " | Handshake de topologia emitido com sucesso.");
             }
-        } catch (Exception e) { 
+        } catch (Exception e) {
             System.err.println("[Java:Erro] Falha ao despachar pacote de descoberta: " + e.getMessage());
         }
     }
@@ -297,13 +328,82 @@ public class sensor {
     }
 
     /** Motor contínuo de amostragem e despacho de DataPayload */
+    private static void sendTelemetryPayload(
+        DatagramSocket socket,
+        DeviceState device,
+        String triggerReason,
+        Integer queueLengthOverride
+    ) {
+        long now = Instant.now().getEpochSecond();
+
+        // Composição de ID único para idempotência no Gateway
+        String msgId = device.deviceId + "-" + now + "-" + java.util.UUID.randomUUID().toString().substring(0, 5);
+
+        Messages.DataPayload.Builder builder = Messages.DataPayload.newBuilder()
+            .setMessageId(msgId)
+            .setTimestamp(now)
+            .setDeviceId(device.deviceId)
+            .setCurrentStatus(Messages.DeviceStatus.forNumber(device.currentStatus));
+
+        Integer queueLength = queueLengthOverride;
+        if (device.currentStatus == Messages.DeviceStatus.STATUS_ON_VALUE) {
+            if (queueLength == null) {
+                queueLength = sampleQueueLength();
+            }
+            builder.addMetrics(Messages.Metric.newBuilder().setName("state").setValue(1).setUnit("code"));
+            builder.addMetrics(Messages.Metric.newBuilder().setName("queue_length").setValue(queueLength).setUnit("vehicles"));
+        }
+
+        Messages.DataPayload p = builder.build();
+        byte[] b = p.toByteArray();
+
+        // Roteamento estrito para o pipeline de Telemetria contínua
+        if (sendUdpWithRetry(socket, b, GATEWAY_TELEMETRY_PORT, "Telemetria")) {
+            String eventLabel = triggerReason == null ? "Telemetria injetada" : "Evento por limiar";
+            System.out.println("[Java:UDP] " + eventLabel
+                + " | Dispositivo=" + device.deviceId
+                + " | Setor=" + device.sector
+                + " | ID=" + msgId
+                + " | Status=" + Messages.DeviceStatus.forNumber(device.currentStatus)
+                + (queueLength == null ? "" : " | Fila=" + queueLength + " veiculos")
+                + (triggerReason == null ? "" : " | Limiar=" + triggerReason));
+        }
+    }
+
+    private static void pollThresholdEvent(DatagramSocket socket, DeviceState device, long nowMillis) {
+        if (nowMillis < device.nextThresholdCheckAtMillis) {
+            return;
+        }
+        device.nextThresholdCheckAtMillis = nowMillis + THRESHOLD_SCAN_INTERVAL_MS;
+
+        if (
+            device.currentStatus != Messages.DeviceStatus.STATUS_ON_VALUE
+            || nowMillis - device.lastThresholdSendAtMillis < THRESHOLD_EVENT_COOLDOWN_MS
+        ) {
+            return;
+        }
+
+        int queueLength = sampleQueueLength();
+        String triggerReason = queueThresholdReason(queueLength);
+        if (triggerReason != null) {
+            device.lastThresholdSendAtMillis = nowMillis;
+            sendTelemetryPayload(socket, device, triggerReason, queueLength);
+        }
+    }
+
     private static void runTelemetryLoop() {
         try (DatagramSocket socket = new DatagramSocket()) {
             while (true) {
                 long nowMillis = System.currentTimeMillis();
                 for (String deviceId : DEVICE_ORDER) {
                     DeviceState device = DEVICES.get(deviceId);
-                    if (device == null || nowMillis < device.nextSendAtMillis) {
+                    if (device == null) {
+                        continue;
+                    }
+
+                    pollThresholdEvent(socket, device, nowMillis);
+
+                    if (nowMillis < device.nextSendAtMillis) {
                         continue;
                     }
 
@@ -312,32 +412,15 @@ public class sensor {
                     }
                     device.nextSendAtMillis = nowMillis + telemetryDelayMillis(device.frequencySecs);
 
-                    long now = Instant.now().getEpochSecond();
-                    
-                    // Composição de ID único para idempotência no Gateway
-                    String msgId = device.deviceId + "-" + now + "-" + java.util.UUID.randomUUID().toString().substring(0, 5);
-
-                    Messages.DataPayload.Builder builder = Messages.DataPayload.newBuilder()
-                        .setMessageId(msgId)
-                        .setTimestamp(now)
-                        .setDeviceId(device.deviceId)
-                        .setCurrentStatus(Messages.DeviceStatus.forNumber(device.currentStatus));
-
+                    Integer queueLength = null;
                     if (device.currentStatus == Messages.DeviceStatus.STATUS_ON_VALUE) {
-                        builder.addMetrics(Messages.Metric.newBuilder().setName("state").setValue(1).setUnit("code"));
+                        queueLength = sampleQueueLength();
+                        if (queueThresholdReason(queueLength) != null) {
+                            device.lastThresholdSendAtMillis = nowMillis;
+                        }
                     }
 
-                    Messages.DataPayload p = builder.build();
-                    
-                    byte[] b = p.toByteArray();
-                    
-                    // Roteamento estrito para o pipeline de Telemetria contínua
-                    if (sendUdpWithRetry(socket, b, GATEWAY_TELEMETRY_PORT, "Telemetria")) {
-                        System.out.println("[Java:UDP] Telemetria injetada | Dispositivo=" + device.deviceId
-                            + " | Setor=" + device.sector
-                            + " | ID=" + msgId
-                            + " | Status=" + Messages.DeviceStatus.forNumber(device.currentStatus));
-                    }
+                    sendTelemetryPayload(socket, device, null, queueLength);
                 }
                 
                 // Suspensão curta: cada dispositivo gerencia sua própria janela de amostragem.

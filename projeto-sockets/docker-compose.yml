@@ -15,6 +15,8 @@ services:
       - "5002:5002/udp"  # Registro de descoberta de sensores externos
     volumes:
       - gateway_db:/app/db
+    environment:
+      - PYTHONUNBUFFERED=1  # Garante que os logs sejam exibidos em tempo real (comportamento equivalente aos sensores C, Lua e Java)
     networks:
       - smart_city_net
     restart: always
@@ -33,6 +35,8 @@ services:
   # 2. SENSOR DE CLIMA (NÓ C - CONTÍNUO)
   # ==================================================================
   sensor_clima:
+    environment:
+    - C_DEVICE_COUNT=6  # Configura o número de dispositivos simulados (ajustável sem recompilação)
     build:
       context: .
       dockerfile: sensor_c/Dockerfile
@@ -118,6 +122,7 @@ services:
         condition: service_healthy
     networks:
       - smart_city_net
+    restart: on-failure
 
 networks:
   smart_city_net:
