@@ -36,6 +36,17 @@ public class sensor {
         }
     }
 
+    private static final InetAddress GATEWAY_ADDR;
+    static {
+        try {
+            GATEWAY_ADDR = InetAddress.getByName(GATEWAY_HOST);
+        } catch (UnknownHostException e) {
+            throw new ExceptionInInitializerError(
+                "Falha ao resolver gateway DNS '" + GATEWAY_HOST + "': " + e.getMessage()
+            );
+        }
+    }
+
     // Portas segregadas para multiplexação espacial UDP
     private static final int GATEWAY_TELEMETRY_PORT = 5000;
     private static final int GATEWAY_DISCOVERY_PORT = 5002;
@@ -48,6 +59,12 @@ public class sensor {
     private static final long RETRY_MAX_DELAY_MS = 1500L;
     private static final long TELEMETRY_JITTER_MS = 350L;
     private static final long DISCOVERY_PROBE_JITTER_MS = 2_000L;
+    private static final long HEARTBEAT_INTERVAL_MS = envSecondsToMillis(
+        "SENSOR_HEARTBEAT_INTERVAL_SECS", 10.0, 1_000L
+    );
+    private static final long HEARTBEAT_JITTER_MS = envSecondsToMillis(
+        "SENSOR_HEARTBEAT_JITTER_SECS", 2.0, 0L
+    );
     private static final int MAX_TCP_FRAME_BYTES = 1024 * 1024;
     private static final long MANUAL_OVERRIDE_MS = 30_000L;
     private static final long THRESHOLD_SCAN_INTERVAL_MS = 1_000L;
@@ -103,7 +120,10 @@ public class sensor {
         // 3. Alocação da Thread de Recuperação via canal Multicast
         new Thread(sensor::startMulticastListener).start();
 
-        // 4. Bloqueio da Thread Principal no Loop de Telemetria UDP
+        // 4. Renovação periódica explícita de presença no Gateway
+        new Thread(sensor::startHeartbeatLoop).start();
+
+        // 5. Bloqueio da Thread Principal no Loop de Telemetria UDP
         runTelemetryLoop();
     }
 
@@ -125,6 +145,24 @@ public class sensor {
 
     private static long telemetryDelayMillis(int frequencySecs) {
         return (frequencySecs * 1000L) + RNG.nextInt((int) TELEMETRY_JITTER_MS + 1);
+    }
+
+    private static long envSecondsToMillis(String name, double defaultValue, long minMillis) {
+        String raw = System.getenv().getOrDefault(name, Double.toString(defaultValue));
+        try {
+            return Math.max(minMillis, Math.round(Double.parseDouble(raw) * 1000.0));
+        } catch (NumberFormatException e) {
+            System.err.println("[Java:Config] Valor inválido para " + name + "='" + raw
+                + "'. Usando padrão " + defaultValue + "s.");
+            return Math.max(minMillis, Math.round(defaultValue * 1000.0));
+        }
+    }
+
+    private static long heartbeatDelayMillis() {
+        long jitter = HEARTBEAT_JITTER_MS <= 0L
+            ? 0L
+            : (long) (RNG.nextDouble() * ((double) HEARTBEAT_JITTER_MS + 1.0));
+        return HEARTBEAT_INTERVAL_MS + jitter;
     }
 
     private static int randomDeviceStatus() {
@@ -174,8 +212,7 @@ public class sensor {
     private static boolean sendUdpWithRetry(DatagramSocket socket, byte[] buf, int port, String channel) {
         for (int attempt = 0; attempt < UDP_MAX_RETRIES; attempt++) {
             try {
-                InetAddress gateway = InetAddress.getByName(GATEWAY_HOST);
-                socket.send(new DatagramPacket(buf, buf.length, gateway, port));
+                socket.send(new DatagramPacket(buf, buf.length, GATEWAY_ADDR, port));
                 return true;
             } catch (Exception e) {
                 if (!waitBeforeRetry(channel, attempt, e)) {
@@ -189,13 +226,13 @@ public class sensor {
     }
 
     /** Empacota e despacha o descritor de topologia para a porta 5002 */
-    private static void sendDiscovery() {
+    private static synchronized void sendDiscovery() {
         for (String deviceId : DEVICE_ORDER) {
             sendDiscovery(deviceId);
         }
     }
 
-    private static void sendDiscovery(String deviceId) {
+    private static synchronized void sendDiscovery(String deviceId) {
         DeviceState device = DEVICES.get(deviceId);
         if (device == null) return;
 
@@ -221,6 +258,20 @@ public class sensor {
             }
         } catch (Exception e) {
             System.err.println("[Java:Erro] Falha ao despachar pacote de descoberta: " + e.getMessage());
+        }
+    }
+
+    private static void startHeartbeatLoop() {
+        while (true) {
+            try {
+                Thread.sleep(heartbeatDelayMillis());
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+
+            System.out.println("[Java:Heartbeat] Renovando presença da frota via DiscoveryResponse.");
+            sendDiscovery();
         }
     }
 

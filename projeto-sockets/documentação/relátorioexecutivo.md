@@ -29,7 +29,7 @@ O sistema demonstra conceitos de sistemas distribuídos, IoT, sockets UDP/TCP, P
 |---|---:|---|
 | UDP | 5000 | Telemetria `DataPayload` |
 | TCP | 5001 | Dashboard/Gateway |
-| UDP | 5002 | Descoberta `DiscoveryResponse` |
+| UDP | 5002 | Descoberta/heartbeat `DiscoveryResponse` |
 | TCP | 5002 | Controle do sensor Lua |
 | TCP | 5003 | Controle do sensor Java |
 | TCP | 5004 | Controle do sensor Python |
@@ -57,12 +57,16 @@ O sistema atual possui:
 
 * IDs estáveis por tipo/setor/ordinal;
 * detecção automática de offline;
+* heartbeat explícito dos sensores para renovar `last_seen`;
 * envio periódico com jitter;
 * envio imediato por limiar;
 * retry UDP com backoff exponencial;
 * jitter de 0 a 2000 ms nas respostas multicast;
 * TCP persistente entre dashboard e gateway;
 * classificação de erros TCP no cliente;
+* ingestão SQLite em batch;
+* rollups OLAP de 1 minuto, 5 minutos e 1 hora;
+* retenção configurável para dados brutos e agregados;
 * healthchecks para todos os containers;
 * dashboard com inspeção individual de sensores.
 
@@ -77,11 +81,17 @@ O sistema atual possui:
 
 ## 7. Resiliência
 
-O gateway registra `last_seen` e marca dispositivos como `STATUS_OFF` quando ultrapassam o timeout configurado. Probes multicast periódicos pedem aos sensores que reanunciem a topologia, e o jitter de resposta evita thundering herd.
+O gateway registra `last_seen` e marca dispositivos como `STATUS_OFF` quando ultrapassam o timeout configurado. Cada sensor renova presença periodicamente com `DiscoveryResponse` e jitter de heartbeat; probes multicast continuam disponíveis para pedir reanúncio de topologia, também com jitter para evitar thundering herd.
 
 O Compose usa healthchecks para coordenar inicialização e indicar falhas operacionais.
 
-## 8. Limitações
+## 8. Gestão de Dados
+
+Para evitar degradação após operação contínua, a telemetria é gravada em batch e o gateway mantém tabelas agregadas por minuto, 5 minutos e hora. As consultas OLAP escolhem automaticamente entre a tabela bruta e os rollups conforme o tamanho da janela temporal.
+
+O banco também possui retenção configurável: a tabela bruta pode ser limitada a poucos dias, enquanto os rollups preservam histórico compacto por períodos maiores.
+
+## 9. Limitações
 
 Ainda não há:
 
@@ -94,6 +104,6 @@ Ainda não há:
 
 O gateway continua sendo ponto único de falha, mas a arquitetura está adequada ao objetivo acadêmico de simular comunicação distribuída heterogênea.
 
-## 9. Conclusão
+## 10. Conclusão
 
-A versão atual está mais robusta que a versão inicial: reduz código morto, evita dispositivos fantasmas, separa portas por finalidade, adiciona recovery com jitter, melhora o cliente TCP e amplia observabilidade por healthchecks e inspeção individual.
+A versão atual está mais robusta que a versão inicial: reduz código morto, evita dispositivos fantasmas, separa portas por finalidade, adiciona recovery com jitter, melhora o cliente TCP, compacta dados históricos para OLAP e amplia observabilidade por healthchecks e inspeção individual.

@@ -18,7 +18,7 @@ Componentes principais:
 |---|---:|---:|---|
 | Telemetria | UDP | 5000 | Exclusiva para `DataPayload` dos sensores para o gateway |
 | Cliente/Gateway | TCP | 5001 | Dashboard envia `ClientRequest` e recebe `ClientResponse` |
-| Descoberta | UDP | 5002 | Sensores enviam `DiscoveryResponse` ao gateway |
+| Descoberta/heartbeat | UDP | 5002 | Sensores enviam `DiscoveryResponse` ao gateway |
 | Controle Lua | TCP | 5002 | Gateway encaminha `ConfigCommand` para o sensor Lua |
 | Controle Java | TCP | 5003 | Gateway encaminha `ConfigCommand` para o sensor Java |
 | Controle Python | TCP | 5004 | Gateway encaminha `ConfigCommand` para o sensor Python |
@@ -57,12 +57,26 @@ O servidor TCP do cliente aceita múltiplos frames na mesma conexão. Isso reduz
 
 ## 5. Persistência
 
-O banco `smartcity_gateway.db` possui duas tabelas principais:
+O banco `smartcity_gateway.db` possui inventário, dados brutos e tabelas agregadas:
 
 * `devices`: inventário, tipo, status, IP, porta de controle, controlabilidade e `last_seen`.
-* `metrics`: séries temporais de métricas por dispositivo.
+* `metrics`: séries temporais brutas por dispositivo.
+* `metrics_rollup_1m`: agregados por minuto.
+* `metrics_rollup_5m`: agregados por 5 minutos.
+* `metrics_rollup_1h`: agregados por hora.
 
-O índice `idx_metrics(metric_name, timestamp)` acelera consultas OLAP por janela temporal.
+Cada rollup guarda contagem, soma, soma dos quadrados, mínimo e máximo. Essa estrutura permite calcular média, desvio padrão e maior variação sem carregar milhões de linhas em memória.
+
+Os índices principais são:
+
+* `idx_metrics_metric_time_device`;
+* `idx_metrics_device_metric_time`;
+* `idx_metrics_timestamp`;
+* índices equivalentes por métrica, bucket e dispositivo nas tabelas de rollup.
+
+A ingestão usa fila assíncrona e escrita em batch, reduzindo commits e contenção de I/O. O mesmo batch grava a tabela bruta e atualiza os rollups com UPSERT incremental.
+
+Há retenção periódica configurável: `metrics` pode ser expurgada após alguns dias, enquanto rollups de 1 minuto, 5 minutos e 1 hora têm políticas independentes. No boot, o gateway pode preencher rollups a partir de dados brutos já existentes.
 
 ## 6. Presença e Offline Automático
 
@@ -86,7 +100,7 @@ Isso evita dispositivos fantasmas no SQLite após reboot do container.
 | `sensor_semaforo` | Java | Semáforo | TCP 5003 | `state`, `queue_length` |
 | `sensor_camera` | Python | Câmera de tráfego | TCP 5004 | `vehicles_count`, `infractions` |
 
-Todos enviam `DiscoveryResponse` em `5002/UDP` e `DataPayload` em `5000/UDP`.
+Todos enviam `DiscoveryResponse` em `5002/UDP` no boot, no heartbeat periódico e em respostas de recovery; `DataPayload` segue dedicado à telemetria em `5000/UDP`.
 
 ## 8. Envio Periódico e Eventos por Limiar
 
@@ -101,7 +115,9 @@ Além da telemetria periódica com jitter, os sensores simulam amostras intermed
 
 Os envios por limiar usam cooldown de 3 segundos para evitar rajadas.
 
-## 9. Multicast Recovery e Mitigação de Thundering Herd
+## 9. Heartbeat, Multicast Recovery e Mitigação de Thundering Herd
+
+Cada sensor renova presença no gateway com `DiscoveryResponse` a cada 10 segundos mais jitter configurável de até 2 segundos. O gateway persiste esse sinal com UPSERT em `devices`, atualizando `last_seen`, status operacional, IP e porta de controle sem recriar linhas.
 
 O gateway envia `SMARTCITY_DISCOVERY_PROBE` para `239.0.0.1:5005`. Ao receber o probe, cada sensor aguarda jitter aleatório de 0 a 2000 ms antes de reenviar `DiscoveryResponse`.
 
@@ -119,6 +135,15 @@ O dashboard Streamlit oferece:
 * reuso de conexão TCP persistente com o gateway.
 
 O cliente diferencia falhas como timeout, conexão recusada, frame inválido, erro Protobuf e erro de socket. A aba de comandos envia requisições em background para evitar congelamento da UI.
+
+Nas consultas OLAP, o gateway escolhe automaticamente a fonte:
+
+* `metrics` para janelas curtas;
+* `metrics_rollup_1m` para janelas médias;
+* `metrics_rollup_5m` para janelas longas;
+* `metrics_rollup_1h` para histórico extenso.
+
+Quando rollups ainda não existem para uma janela antiga, a consulta volta para `metrics` como fallback.
 
 ## 11. Healthchecks
 

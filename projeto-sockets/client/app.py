@@ -115,6 +115,7 @@ class GatewayTcpClient:
             self._lock.release()
 
     def _recv_exact_locked(self, size: int) -> bytes:
+        assert self._sock is not None, "Socket não inicializado em _recv_exact_locked"
         data = bytearray()
         while len(data) < size:
             chunk = self._sock.recv(size - len(data))
@@ -131,6 +132,7 @@ class GatewayTcpClient:
             for attempt in range(2):
                 try:
                     self._connect_locked()
+                    assert self._sock is not None, "Socket não inicializado após _connect_locked"
                     self._sock.sendall(frame)
 
                     header = self._recv_exact_locked(4)
@@ -358,6 +360,7 @@ METRIC_UNITS = {
 
 DEVICE_METRICS_MAP = {
     messages_pb2.DEVICE_TYPE_WEATHER_STATION: ["temperature", "humidity", "co2", "pm25", "pm10", "aqi"],
+    messages_pb2.DEVICE_TYPE_AIR_QUALITY: ["temperature", "humidity", "co2", "pm25", "pm10", "aqi"],
     messages_pb2.DEVICE_TYPE_LAMP_POST: ["luminosity", "power_consumption"],
     messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT: ["state", "queue_length"],
     messages_pb2.DEVICE_TYPE_CAMERA: ["vehicles_count", "infractions"],
@@ -509,178 +512,180 @@ with tab2:
         controllable_devices = [d for d in st.session_state.device_history if d.is_controllable]
         device_ids = [d.device_id for d in controllable_devices]
         
-        col_sel, col_det = st.columns([1, 1])
-        
-        with col_sel:
-            if st.session_state.selected_device_id not in device_ids and device_ids:
-                st.session_state.selected_device_id = device_ids[0]
+        if not device_ids:
+            st.warning("Nenhum dispositivo controlável disponível. Sincronize a topologia primeiro.")
+        else:
+            col_sel, col_det = st.columns([1, 1])
             
-            # [R7] Parâmetro index= removido — conflitava silenciosamente com key=.
-            # Quando key= está presente, o Streamlit usa session_state[key] como
-            # valor do widget; index= é ignorado após o primeiro render e pode
-            # divergir do estado real em edge cases de reordenação da lista.
-            # O guard acima (selected_device_id not in device_ids) já garante
-            # que session_state contém sempre um valor válido antes do widget renderizar.
-            target_id = st.selectbox(
-                "Selecione o Nó Alvo de Atuação", 
-                options=device_ids,
-                key="selected_device_id"
-            )
-            
-            selected_device = next((d for d in controllable_devices if d.device_id == target_id), None)
-        
-        if selected_device:
-            with col_det:
-                st.markdown(f"""
-                **Tabela de Assinatura do Nó:**
-                - **Classificação:** `{TYPE_MAP.get(selected_device.type, "Desconhecido")}`
-                - **Socket Escuta:** `{selected_device.ip_address}:{selected_device.control_port}`
-                - **Estado Local:** `{STATUS_MAP.get(selected_device.status, "Desconhecido")}`
-                """)
-
-            st.divider()
-            
-            if st.session_state.last_cmd_result:
-                c_msg, c_clr = st.columns([9, 1])
-                with c_msg:
-                    res_type = st.session_state.last_cmd_result["type"]
-                    msg = st.session_state.last_cmd_result["message"]
-                    if res_type == "success": st.success(f"**Confirmação Positiva:** {msg}")
-                    elif res_type == "error": st.error(f"**Falha de I/O:** {msg}")
-                    elif res_type == "warning": st.warning(f"⚠️ {msg}")
-                    elif res_type == "info": st.info(msg)
-                with c_clr:
-                    if st.button("✕", key="clear_msg"):
-                        st.session_state.last_cmd_result = None
-            
-            # FIX 3: Estrutura completamente reativa. st.form foi removido.
-            st.write(f"### Parâmetros de Intervenção: `{target_id}`")
-            
-            c1, c2 = st.columns(2)
-            
-            with c1:
-                alterar_status = st.checkbox("Engatilhar Mutação de Estado", value=False)
+            with col_sel:
+                if st.session_state.selected_device_id not in device_ids and device_ids:
+                    st.session_state.selected_device_id = device_ids[0]
                 
-                if selected_device.type == messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT:
-                    status_options = ["Ligar (VERDE)", "Desligar (OFF)", "Emergência (PISCANTE)"]
-                elif selected_device.type == messages_pb2.DEVICE_TYPE_LAMP_POST:
-                    status_options = ["Acender Relé (ON)", "Cortar Relé (OFF)", "Modo Manutenção (ERR)"]
-                elif selected_device.type == messages_pb2.DEVICE_TYPE_CAMERA: 
-                    status_options = ["Gravar Stream (ON)", "Pausar Stream (OFF)", "Diagnóstico Binário (ERR)"]
-                else:
-                    status_options = ["Ativar", "Desativar", "Provocar Falha"]
-                    
-                novo_status_label = st.radio("Seletor de Estado Desejado", status_options, disabled=not alterar_status)
+                # [R7] Parâmetro index= removido — conflitava silenciosamente com key=.
+                # Quando key= está presente, o Streamlit usa session_state[key] como
+                # valor do widget; index= é ignorado após o primeiro render e pode
+                # divergir do estado real em edge cases de reordenação da lista.
+                # O guard acima (selected_device_id not in device_ids) já garante
+                # que session_state contém sempre um valor válido antes do widget renderizar.
+                target_id = st.selectbox(
+                    "Selecione o Nó Alvo de Atuação", 
+                    options=device_ids,
+                    key="selected_device_id"
+                )
+                
+                selected_device = next((d for d in controllable_devices if d.device_id == target_id), None)
             
-            with c2:
-                alterar_freq = st.checkbox("Substituir Relógio de Telemetria", value=False)
-                nova_freq = st.slider("Duty Cycle (Segundos/Datagrama)", 1, 60, 5, 
-                                      help="Altera a agressividade com que o nó dispara pacotes UDP.", 
-                                      disabled=not alterar_freq)
+            if selected_device:
+                with col_det:
+                    st.markdown(f"""
+                    **Tabela de Assinatura do Nó:**
+                    - **Classificação:** `{TYPE_MAP.get(selected_device.type, "Desconhecido")}`
+                    - **Socket Escuta:** `{selected_device.ip_address}:{selected_device.control_port}`
+                    - **Estado Local:** `{STATUS_MAP.get(selected_device.status, "Desconhecido")}`
+                    """)
 
-            st.markdown("---")
-
-            completed_command = consume_tcp_task("command_task", "Comando TCP")
-            if completed_command:
-                result, context = completed_command
-                resp = result.response
-                ts = datetime.datetime.now().strftime('%H:%M:%S')
-
-                if resp:
-                    st.session_state.command_history.append({
-                        "timestamp": ts,
-                        "device": context["target_id"],
-                        "command_id": context["command_id"],
-                        "status": "✓ Aprovado" if resp.success else "✗ Recusado",
-                        "message": resp.message,
-                    })
-
-                    if resp.success:
-                        # Reconciliação do estado no buffer da UI para não exigir novo "Atualizar Topologia"
-                        for device in st.session_state.device_history:
-                            if device.device_id == context["target_id"]:
-                                if context["update_status"]:
-                                    device.status = context["target_status"]
-                                device.last_seen_timestamp = int(time.time())
-                                break
-
-                        st.session_state.last_cmd_result = {"type": "success", "message": resp.message}
+                st.divider()
+                
+                if st.session_state.last_cmd_result:
+                    c_msg, c_clr = st.columns([9, 1])
+                    with c_msg:
+                        res_type = st.session_state.last_cmd_result["type"]
+                        msg = st.session_state.last_cmd_result["message"]
+                        if res_type == "success": st.success(f"**Confirmação Positiva:** {msg}")
+                        elif res_type == "error": st.error(f"**Falha de I/O:** {msg}")
+                        elif res_type == "warning": st.warning(f"⚠️ {msg}")
+                        elif res_type == "info": st.info(msg)
+                    with c_clr:
+                        if st.button("✕", key="clear_msg"):
+                            st.session_state.last_cmd_result = None
+                
+                # FIX 3: Estrutura completamente reativa. st.form foi removido.
+                st.write(f"### Parâmetros de Intervenção: `{target_id}`")
+                
+                c1, c2 = st.columns(2)
+                
+                with c1:
+                    alterar_status = st.checkbox("Engatilhar Mutação de Estado", value=False)
+                    
+                    if selected_device.type == messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT:
+                        status_options = ["Ligar (VERDE)", "Desligar (OFF)", "Emergência (PISCANTE)"]
+                    elif selected_device.type == messages_pb2.DEVICE_TYPE_LAMP_POST:
+                        status_options = ["Acender Relé (ON)", "Cortar Relé (OFF)", "Modo Manutenção (ERR)"]
+                    elif selected_device.type == messages_pb2.DEVICE_TYPE_CAMERA: 
+                        status_options = ["Gravar Stream (ON)", "Pausar Stream (OFF)", "Diagnóstico Binário (ERR)"]
                     else:
-                        st.session_state.last_cmd_result = {"type": "error", "message": resp.message}
-                else:
-                    st.session_state.command_history.append({
-                        "timestamp": ts,
-                        "device": context["target_id"],
-                        "command_id": context["command_id"],
-                        "status": f"⚠️ {result.error_code}",
-                        "message": result.error_message,
-                    })
-                    st.session_state.last_cmd_result = {
-                        "type": "error",
-                        "message": result.error_message,
-                    }
+                        status_options = ["Ativar", "Desativar", "Provocar Falha"]
+                        
+                    novo_status_label = st.radio("Seletor de Estado Desejado", status_options, disabled=not alterar_status)
+                
+                with c2:
+                    alterar_freq = st.checkbox("Substituir Relógio de Telemetria", value=False)
+                    nova_freq = st.slider("Duty Cycle (Segundos/Datagrama)", 1, 60, 5, 
+                                          help="Altera a agressividade com que o nó dispara pacotes UDP.", 
+                                          disabled=not alterar_freq)
 
-                st.rerun()
-            
-            # Submissão direta e avaliação reativa dos valores correntes no dashboard
-            command_pending = is_tcp_task_pending("command_task")
-            if st.button(
-                "Transmitir Payload de Controle (TCP)",
-                type="primary",
-                use_container_width=True,
-                disabled=command_pending,
-            ):
-                if not alterar_status and not alterar_freq:
-                    st.session_state.last_cmd_result = {"type": "warning", "message": "Nenhum parâmetro selecionado para sobreposição."}
-                    st.rerun()
-                else:
-                    req = messages_pb2.ClientRequest()
-                    req.type = messages_pb2.REQUEST_TYPE_SEND_COMMAND
-                    req.target_device_id = target_id
-                    
-                    cmd = req.command_payload
-                    cmd.command_id = f"CMD-{uuid.uuid4().hex[:6].upper()}"
-                    
-                    if alterar_status:
-                        cmd.update_status = True
-                        if any(x in novo_status_label for x in ["Ligar", "Acender", "Gravar", "Ativar"]):
-                            cmd.target_status = messages_pb2.STATUS_ON
-                        elif any(x in novo_status_label for x in ["Desligar", "Cortar", "Pausar", "Desativar"]):
-                            cmd.target_status = messages_pb2.STATUS_OFF
+                    st.markdown("---")
+
+                completed_command = consume_tcp_task("command_task", "Comando TCP")
+                if completed_command:
+                    result, context = completed_command
+                    resp = result.response
+                    ts = datetime.datetime.now().strftime('%H:%M:%S')
+
+                    if resp:
+                        st.session_state.command_history.append({
+                            "timestamp": ts,
+                            "device": context["target_id"],
+                            "command_id": context["command_id"],
+                            "status": "✓ Aprovado" if resp.success else "✗ Recusado",
+                            "message": resp.message,
+                        })
+
+                        if resp.success:
+                            for device in st.session_state.device_history:
+                                if device.device_id == context["target_id"]:
+                                    if context["update_status"]:
+                                        device.status = context["target_status"]
+                                    device.last_seen_timestamp = int(time.time())
+                                    break
+
+                            st.session_state.last_cmd_result = {"type": "success", "message": resp.message}
                         else:
-                            cmd.target_status = messages_pb2.STATUS_ERROR
-                            
-                    if alterar_freq:
-                        cmd.update_frequency = True
-                        cmd.new_frequency_secs = int(nova_freq)
-
-                    submit_tcp_request(
-                        "command_task",
-                        req,
-                        {
-                            "target_id": target_id,
-                            "command_id": cmd.command_id,
-                            "update_status": bool(cmd.update_status),
-                            "target_status": cmd.target_status,
-                        },
-                    )
-                    st.session_state.last_cmd_result = {
-                        "type": "info",
-                        "message": "Comando enviado em segundo plano; aguardando ACK do Gateway.",
-                    }
+                            st.session_state.last_cmd_result = {"type": "error", "message": resp.message}
+                    else:
+                        st.session_state.command_history.append({
+                            "timestamp": ts,
+                            "device": context["target_id"],
+                            "command_id": context["command_id"],
+                            "status": f"⚠️ {result.error_code}",
+                            "message": result.error_message,
+                        })
+                        st.session_state.last_cmd_result = {
+                            "type": "error",
+                            "message": result.error_message,
+                        }
 
                     st.rerun()
-            
-            st.divider()
-            st.subheader("📜 Auditoria de Atuação Recente")
-            
-            if st.session_state.command_history:
-                history_df = pd.DataFrame(st.session_state.command_history[-10:])
-                history_df = history_df[['timestamp', 'device', 'command_id', 'status', 'message']]
-                history_df.columns = ['Ocorrência', 'Endereço Lógico', 'Hash do Comando', 'Status Execução', 'Retorno I/O']
-                st.dataframe(history_df.iloc[::-1], use_container_width=True, hide_index=True)
-            else:
-                st.info("📋 Tabela de auditoria vazia. Os comandos executados nesta sessão aparecerão aqui.")
+
+                # Submissão direta e avaliação reativa dos valores correntes no dashboard
+                command_pending = is_tcp_task_pending("command_task")
+                if st.button(
+                    "Transmitir Payload de Controle (TCP)",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=command_pending,
+                ):
+                    if not alterar_status and not alterar_freq:
+                        st.session_state.last_cmd_result = {"type": "warning", "message": "Nenhum parâmetro selecionado para sobreposição."}
+                        st.rerun()
+                    else:
+                        req = messages_pb2.ClientRequest()
+                        req.type = messages_pb2.REQUEST_TYPE_SEND_COMMAND
+                        req.target_device_id = target_id
+                        
+                        cmd = req.command_payload
+                        cmd.command_id = f"CMD-{uuid.uuid4().hex[:6].upper()}"
+                        
+                        if alterar_status:
+                            cmd.update_status = True
+                            if any(x in novo_status_label for x in ["Ligar", "Acender", "Gravar", "Ativar"]):
+                                cmd.target_status = messages_pb2.STATUS_ON
+                            elif any(x in novo_status_label for x in ["Desligar", "Cortar", "Pausar", "Desativar"]):
+                                cmd.target_status = messages_pb2.STATUS_OFF
+                            else:
+                                cmd.target_status = messages_pb2.STATUS_ERROR
+                                
+                        if alterar_freq:
+                            cmd.update_frequency = True
+                            cmd.new_frequency_secs = int(nova_freq)
+
+                        submit_tcp_request(
+                            "command_task",
+                            req,
+                            {
+                                "target_id": target_id,
+                                "command_id": cmd.command_id,
+                                "update_status": bool(cmd.update_status),
+                                "target_status": cmd.target_status,
+                            },
+                        )
+                        st.session_state.last_cmd_result = {
+                            "type": "info",
+                            "message": "Comando enviado em segundo plano; aguardando ACK do Gateway.",
+                        }
+
+                        st.rerun()
+                
+                st.divider()
+                st.subheader("📜 Auditoria de Atuação Recente")
+                
+                if st.session_state.command_history:
+                    history_df = pd.DataFrame(st.session_state.command_history[-10:])
+                    history_df = history_df[['timestamp', 'device', 'command_id', 'status', 'message']]
+                    history_df.columns = ['Ocorrência', 'Endereço Lógico', 'Hash do Comando', 'Status Execução', 'Retorno I/O']
+                    st.dataframe(history_df.iloc[::-1], use_container_width=True, hide_index=True)
+                else:
+                    st.info("📋 Tabela de auditoria vazia. Os comandos executados nesta sessão aparecerão aqui.")
 
 # --------------------------------------------------------------------
 # ABA 3: Análise Multidimensional (OLAP)
@@ -865,6 +870,7 @@ with tab4:
             req.type = messages_pb2.REQUEST_TYPE_ANALYTICS_QUERY
             req.query_op = messages_pb2.OP_AVERAGE
             req.query_metric = metrica_inspec_alvo
+            req.target_device_id = target_inspec_id
 
             agora = int(time.time())
             req.end_timestamp = agora
@@ -915,13 +921,14 @@ with tab4:
                         help="Média do intervalo entre timestamps consecutivos enviados pelo sensor.",
                     )
                     col_kpi3.metric(
-                        "Amostras no Mesmo Segundo",
+                        "Eventos no Mesmo Segundo",
                         f"{same_second_rate:.1f}%",
                         f"{same_second_samples} ocorrência(s)",
                         delta_color="off",
                         help=(
-                            "Timestamps iguais podem indicar rajada, retry ou envio imediato por limiar; "
-                            "não significam duplicata Protobuf por si só."
+                            "Taxa de eventos com timestamps idênticos. Comportamento esperado em rajadas "
+                            "ou quando limiares são detectados (telemetria periódica + evento disparado no mesmo segundo). "
+                            "O gateway deduplicou por (timestamp, message_id), então todos os eventos são legítimos."
                         ),
                     )
 

@@ -28,7 +28,7 @@ No Windows, execute os comandos a partir da pasta raiz do projeto, onde está o 
 |---|---:|---|---|
 | gateway | 5000 | UDP | Telemetria `DataPayload` |
 | gateway | 5001 | TCP | Dashboard/Gateway |
-| gateway | 5002 | UDP | Descoberta `DiscoveryResponse` |
+| gateway | 5002 | UDP | Descoberta/heartbeat `DiscoveryResponse` |
 | sensor_posto | 5002 | TCP | Controle do sensor Lua |
 | sensor_java | 5003 | TCP | Controle do sensor Java |
 | sensor_camera | 5004 | TCP | Controle do sensor Python |
@@ -117,6 +117,10 @@ ou:
 podman compose ps
 ```
 
+Os sensores renovam presença automaticamente com `DiscoveryResponse` a cada 10 segundos mais jitter de até 2 segundos. Para ajustar essa cadência, defina `SENSOR_HEARTBEAT_INTERVAL_SECS` e `SENSOR_HEARTBEAT_JITTER_SECS` no serviço desejado.
+
+O gateway também aceita variáveis para gestão de dados, como `TELEMETRY_BATCH_MAX_ROWS`, `METRICS_RAW_RETENTION_SECS`, `ROLLUP_1M_RETENTION_SECS`, `ROLLUP_5M_RETENTION_SECS`, `ROLLUP_1H_RETENTION_SECS` e os limites `OLAP_RAW_MAX_WINDOW_SECS`, `OLAP_1M_MAX_WINDOW_SECS`, `OLAP_5M_MAX_WINDOW_SECS`.
+
 ## 8. Logs
 
 Todos os serviços:
@@ -151,6 +155,11 @@ docker exec gateway sqlite3 db/smartcity_gateway.db \
   "SELECT device_id, metric_name, value, unit FROM metrics ORDER BY id DESC LIMIT 20;"
 ```
 
+```bash
+docker exec gateway sqlite3 db/smartcity_gateway.db \
+  "SELECT metric_name, COUNT(*) FROM metrics_rollup_1m GROUP BY metric_name;"
+```
+
 Com Podman:
 
 ```bash
@@ -161,6 +170,11 @@ podman exec gateway sqlite3 db/smartcity_gateway.db \
 ```bash
 podman exec gateway sqlite3 db/smartcity_gateway.db \
   "SELECT device_id, metric_name, value, unit FROM metrics ORDER BY id DESC LIMIT 20;"
+```
+
+```bash
+podman exec gateway sqlite3 db/smartcity_gateway.db \
+  "SELECT metric_name, COUNT(*) FROM metrics_rollup_1m GROUP BY metric_name;"
 ```
 
 ## 10. Execução Parcial

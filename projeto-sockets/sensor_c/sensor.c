@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <stdatomic.h>
 #include "messages.pb-c.h"
 
 #define GATEWAY_HOST           "gateway"
@@ -25,6 +26,8 @@
 #define UDP_RETRY_MAX_USEC     1500000
 #define TELEMETRY_JITTER_USEC  500000
 #define DISCOVERY_PROBE_JITTER_USEC 2000000
+#define HEARTBEAT_INTERVAL_SECS 10.0
+#define HEARTBEAT_JITTER_SECS   2.0
 #define NUM_METRICS            6
 #define THRESHOLD_SCAN_INTERVAL_SECS 1.0
 #define THRESHOLD_EVENT_COOLDOWN_SECS 3.0
@@ -45,12 +48,15 @@ int global_sockfd = -1;
 struct addrinfo *global_gateway_telemetry_res = NULL;
 struct addrinfo *global_gateway_discovery_res = NULL;
 pthread_t        listener_tid;
+double           heartbeat_interval_secs = HEARTBEAT_INTERVAL_SECS;
+double           heartbeat_jitter_secs   = HEARTBEAT_JITTER_SECS;
 
 /* Frota de dispositivos — tamanho máximo estático, contagem real em device_count */
 int         device_count = 3;
 char        global_device_ids     [DEVICE_COUNT_MAX][64];
 const char *global_device_sectors [DEVICE_COUNT_MAX];
 Smartcity__DeviceStatus global_device_statuses[DEVICE_COUNT_MAX];
+pthread_mutex_t statuses_mutex = PTHREAD_MUTEX_INITIALIZER;
 double      global_last_threshold_send[DEVICE_COUNT_MAX];
 unsigned int global_seq_counter = 0;
 
@@ -130,6 +136,31 @@ static useconds_t retry_delay_usec(int attempt) {
     }
     delay += rand() % UDP_RETRY_BASE_USEC;
     return (useconds_t)delay;
+}
+
+static double read_env_double(const char *name, double fallback, double min_value) {
+    const char *raw = getenv(name);
+    if (raw == NULL || raw[0] == '\0')
+        return fallback;
+
+    char *endptr = NULL;
+    errno = 0;
+    double value = strtod(raw, &endptr);
+    if (errno != 0 || endptr == raw || *endptr != '\0' || value < min_value) {
+        fprintf(stderr,
+                "[Sensor C:Config] %s='%s' inválido. Usando padrão %.1fs.\n",
+                name, raw, fallback);
+        return fallback;
+    }
+
+    return value;
+}
+
+static double heartbeat_delay_secs(void) {
+    double jitter = heartbeat_jitter_secs <= 0.0
+                  ? 0.0
+                  : (((double)rand() / (double)RAND_MAX) * heartbeat_jitter_secs);
+    return heartbeat_interval_secs + jitter;
 }
 
 static void init_metric_descriptors(Smartcity__Metric metrics[NUM_METRICS],
@@ -235,7 +266,10 @@ static int send_environment_payload(int device_idx,
     payload.message_id     = msg_id_buffer;
     payload.timestamp      = now;
     payload.device_id      = global_device_ids[device_idx];
+    
+    pthread_mutex_lock(&statuses_mutex);
     payload.current_status = global_device_statuses[device_idx];
+    pthread_mutex_unlock(&statuses_mutex);
 
     if (payload.current_status == SMARTCITY__DEVICE_STATUS__STATUS_ON) {
         payload.n_metrics = NUM_METRICS;
@@ -289,7 +323,11 @@ static void poll_threshold_events(void) {
     double now_mono = monotonic_seconds();
 
     for (int device_idx = 0; device_idx < device_count; device_idx++) {
-        if (global_device_statuses[device_idx] != SMARTCITY__DEVICE_STATUS__STATUS_ON)
+        pthread_mutex_lock(&statuses_mutex);
+        int is_on = (global_device_statuses[device_idx] == SMARTCITY__DEVICE_STATUS__STATUS_ON);
+        pthread_mutex_unlock(&statuses_mutex);
+        
+        if (!is_on)
             continue;
 
         if ((now_mono - global_last_threshold_send[device_idx]) < THRESHOLD_EVENT_COOLDOWN_SECS)
@@ -376,7 +414,12 @@ void send_discovery_announcement(void) {
         disc.device_id       = global_device_ids[i];
         disc.type            = SMARTCITY__DEVICE_TYPE__DEVICE_TYPE_WEATHER_STATION;
         disc.ip_address      = self_hostname;
+        
+        pthread_mutex_lock(&statuses_mutex);
         disc.initial_status  = global_device_statuses[i];
+        Smartcity__DeviceStatus status = global_device_statuses[i];
+        pthread_mutex_unlock(&statuses_mutex);
+        
         disc.is_controllable = 0;
         disc.control_port    = 0;
 
@@ -396,7 +439,7 @@ void send_discovery_announcement(void) {
             printf("[Sensor C:Descoberta] Dispositivo=%s | Setor=%s | Status=%s"
                    " | Handshake emitido via porta %s.\n",
                    global_device_ids[i], global_device_sectors[i],
-                   status_to_text(global_device_statuses[i]), GATEWAY_DISCOVERY_PORT);
+                   status_to_text(status), GATEWAY_DISCOVERY_PORT);
         } else {
             fprintf(stderr, "[Sensor C:Erro] Descoberta de %s descartada após retries.\n",
                     global_device_ids[i]);
@@ -479,6 +522,11 @@ void *multicast_listener_thread(void *arg) {
 int main(void) {
     srand((unsigned int)(time(NULL) ^ getpid()));
 
+    heartbeat_interval_secs = read_env_double("SENSOR_HEARTBEAT_INTERVAL_SECS",
+                                              HEARTBEAT_INTERVAL_SECS, 1.0);
+    heartbeat_jitter_secs = read_env_double("SENSOR_HEARTBEAT_JITTER_SECS",
+                                            HEARTBEAT_JITTER_SECS, 0.0);
+
     const char *env_count = getenv("C_DEVICE_COUNT");
     if (env_count != NULL && env_count[0] != '\0') {
         int parsed = atoi(env_count);
@@ -560,10 +608,22 @@ int main(void) {
     if (pthread_create(&listener_tid, NULL, multicast_listener_thread, NULL) != 0)
         perror("[Sensor C:Aviso] Falha ao criar thread Multicast");
 
+    double next_heartbeat_at = monotonic_seconds() + heartbeat_delay_secs();
+
     /* 5. Loop principal de telemetria — usa exclusivamente global_sockfd */
     while (keep_running) {
+        double now_mono = monotonic_seconds();
+        if (now_mono >= next_heartbeat_at) {
+            printf("[Sensor C:Heartbeat] Renovando presença da frota via DiscoveryResponse.\n");
+            send_discovery_announcement();
+            next_heartbeat_at = now_mono + heartbeat_delay_secs();
+        }
+
         for (int device_idx = 0; device_idx < device_count; device_idx++) {
+            pthread_mutex_lock(&statuses_mutex);
             global_device_statuses[device_idx] = random_device_status();
+            Smartcity__DeviceStatus current_status = global_device_statuses[device_idx];
+            pthread_mutex_unlock(&statuses_mutex);
 
             Smartcity__Metric  metrics[NUM_METRICS];
             Smartcity__Metric *metrics_list[NUM_METRICS];
@@ -572,7 +632,7 @@ int main(void) {
             init_metric_descriptors(metrics, metrics_list);
             populate_environment_metrics(metrics);
 
-            if (global_device_statuses[device_idx] == SMARTCITY__DEVICE_STATUS__STATUS_ON
+            if (current_status == SMARTCITY__DEVICE_STATUS__STATUS_ON
                 && environment_threshold_reason(metrics, reason, sizeof(reason)) != NULL) {
                 global_last_threshold_send[device_idx] = monotonic_seconds();
             }

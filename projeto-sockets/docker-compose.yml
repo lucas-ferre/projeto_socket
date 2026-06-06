@@ -13,6 +13,7 @@ services:
       - "5000:5000/udp"  # Ingestão de telemetria contínua
       - "5001:5001/tcp"  # Interface de streaming analítico e atuação
       - "5002:5002/udp"  # Registro de descoberta de sensores externos
+      - "5005:5005/udp"  # Canal multicast de descoberta de topologia
     volumes:
       - gateway_db:/app/db
     environment:

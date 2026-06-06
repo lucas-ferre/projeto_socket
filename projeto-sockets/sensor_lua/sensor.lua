@@ -23,10 +23,10 @@ local SECTORS = {
     { name = "Porangabussu", slug = "porangabussu" }
 }
 
-local CONTROL_PORT           = 5002
+local CONTROL_TCP_PORT       = 5002
 local GATEWAY_HOST           = "gateway"
 local GATEWAY_TELEMETRY_PORT = 5000
-local GATEWAY_DISCOVERY_PORT = 5002
+local GATEWAY_UDP_DISCOVERY_PORT = 5002
 local MULTICAST_GROUP        = "239.0.0.1"
 local MULTICAST_PORT         = 5005
 local UDP_MAX_RETRIES        = 3
@@ -34,6 +34,8 @@ local RETRY_BASE_DELAY       = 0.20
 local RETRY_MAX_DELAY        = 1.50
 local TELEMETRY_JITTER_SECS  = 0.35
 local DISCOVERY_PROBE_JITTER_SECS = 2.0
+local HEARTBEAT_INTERVAL_SECS = math.max(1.0, tonumber(os.getenv("SENSOR_HEARTBEAT_INTERVAL_SECS") or "10") or 10.0)
+local HEARTBEAT_JITTER_SECS   = math.max(0.0, tonumber(os.getenv("SENSOR_HEARTBEAT_JITTER_SECS") or "2") or 2.0)
 local MAX_TCP_FRAME_BYTES    = 1024 * 1024
 local MANUAL_OVERRIDE_SECS   = 30.0
 local THRESHOLD_SCAN_INTERVAL_SECS = 1.0
@@ -118,9 +120,9 @@ print(string.format("[Sensor Lua:Multicast] Interface vinculada ao grupo de resi
       MULTICAST_GROUP, MULTICAST_PORT))
 
 -- C. Socket TCP Servidor: aceita conexões de controle (atuador)
-local tcp_server = assert(socket.bind("0.0.0.0", CONTROL_PORT))
+local tcp_server = assert(socket.bind("0.0.0.0", CONTROL_TCP_PORT))
 tcp_server:settimeout(0)
-print(string.format("[Sensor Lua:TCP] Interface de controle provisionada na porta %d.", CONTROL_PORT))
+print(string.format("[Sensor Lua:TCP] Interface de controle provisionada na porta %d.", CONTROL_TCP_PORT))
 
 -- ====================================================================
 -- UTILITÁRIOS DE PROTOCOLO
@@ -133,6 +135,10 @@ end
 
 local function discovery_probe_jitter()
     return math.random() * DISCOVERY_PROBE_JITTER_SECS
+end
+
+local function heartbeat_delay()
+    return HEARTBEAT_INTERVAL_SECS + (math.random() * HEARTBEAT_JITTER_SECS)
 end
 
 local function random_device_status()
@@ -231,17 +237,17 @@ local function send_discovery_response(target_device_id)
                 device_id       = device.device_id,
                 type            = "DEVICE_TYPE_LAMP_POST",
                 ip_address      = "sensor_posto",
-                control_port    = CONTROL_PORT,
+                control_port    = CONTROL_TCP_PORT,
                 initial_status  = device.status,
                 is_controllable = true
             }
             local bytes = assert(pb.encode("smartcity.DiscoveryResponse", msg))
             -- GATEWAY_IP: variável resolvida no boot — sem chamada DNS por pacote
-            local ok, err = send_udp_with_retry(bytes, GATEWAY_IP, GATEWAY_DISCOVERY_PORT, "Descoberta")
+            local ok, err = send_udp_with_retry(bytes, GATEWAY_IP, GATEWAY_UDP_DISCOVERY_PORT, "Descoberta")
             if ok then
                 print(string.format(
                     "[Sensor Lua:Descoberta] Dispositivo=%s | Setor=%s | Status=%s | Vetor topológico despachado via porta %d.",
-                    device.device_id, device.sector, device.status, GATEWAY_DISCOVERY_PORT))
+                    device.device_id, device.sector, device.status, GATEWAY_UDP_DISCOVERY_PORT))
             else
                 print(string.format("[Sensor Lua:Erro] Descoberta descartada após retries: %s", err))
             end
@@ -446,6 +452,7 @@ end
 -- ====================================================================
 
 send_discovery_response()
+local next_heartbeat_at = socket.gettime() + heartbeat_delay()
 
 while true do
     local current_time = socket.gettime()
@@ -453,7 +460,14 @@ while true do
     -- 1. Eventos imediatos por limiar sem deslocar a cadência periódica
     poll_threshold_events(current_time)
 
-    -- 2. Despacho sequencial de telemetria UDP
+    -- 2. Heartbeat topológico independente da cadência de métricas
+    if current_time >= next_heartbeat_at then
+        print("[Sensor Lua:Heartbeat] Renovando presença da frota via DiscoveryResponse.")
+        send_discovery_response()
+        next_heartbeat_at = socket.gettime() + heartbeat_delay()
+    end
+
+    -- 3. Despacho sequencial de telemetria UDP
     for _, device_id in ipairs(device_order) do
         local device = devices[device_id]
         if (current_time - device.last_udp_send) >= (device.frequency_secs + device.next_jitter_secs) then
@@ -463,12 +477,12 @@ while true do
         end
     end
 
-    -- 3. Inspeção da fila TCP para requisições de controle
+    -- 4. Inspeção da fila TCP para requisições de controle
     poll_control_commands()
 
-    -- 4. Inspeção da interface multicast para probes de disaster recovery
+    -- 5. Inspeção da interface multicast para probes de disaster recovery
     poll_multicast_probes()
 
-    -- 5. Cessão de ciclos de CPU ao kernel host
+    -- 6. Cessão de ciclos de CPU ao kernel host
     socket.sleep(0.1 + (math.random() * TELEMETRY_JITTER_SECS / 10))
 end

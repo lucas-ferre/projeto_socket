@@ -27,12 +27,33 @@ SECTORS = (
 CAMERA_DEVICE_COUNT = max(1, int(os.getenv("CAMERA_DEVICE_COUNT", str(len(SECTORS)))))
 DEVICE_HOSTNAME = "sensor_camera"
 
+
+def env_float(name: str, default: float, min_value: float) -> float:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        print(f"[sensor_camera] | [Sensor Python:Config] {name}='{raw_value}' invalido. Usando {default}s.")
+        return default
+
+    if value < min_value:
+        print(
+            f"[sensor_camera] | [Sensor Python:Config] {name}='{raw_value}' abaixo do minimo "
+            f"{min_value}s. Usando {default}s."
+        )
+        return default
+
+    return value
+
+
 MAX_FRAME_SIZE = 1024 * 1024
 MAX_UDP_SEND_ATTEMPTS = 3
 BASE_RETRY_DELAY_SECS = 0.2
 MAX_RETRY_DELAY_SECS = 1.5
 TELEMETRY_JITTER_SECS = 0.35
 DISCOVERY_PROBE_JITTER_SECS = 2.0
+HEARTBEAT_INTERVAL_SECS = env_float("SENSOR_HEARTBEAT_INTERVAL_SECS", 10.0, 1.0)
+HEARTBEAT_JITTER_SECS = env_float("SENSOR_HEARTBEAT_JITTER_SECS", 2.0, 0.0)
 MANUAL_OVERRIDE_SECS = 30.0
 THRESHOLD_SCAN_INTERVAL_SECS = 1.0
 THRESHOLD_EVENT_COOLDOWN_SECS = 3.0
@@ -90,6 +111,10 @@ def telemetry_wait_secs(frequency_secs: int) -> float:
 
 def discovery_probe_jitter_secs() -> float:
     return random.uniform(0.0, DISCOVERY_PROBE_JITTER_SECS)
+
+
+def heartbeat_wait_secs() -> float:
+    return HEARTBEAT_INTERVAL_SECS + random.uniform(0.0, HEARTBEAT_JITTER_SECS)
 
 
 def send_udp_message(message, port: int) -> None:
@@ -426,6 +451,15 @@ def multicast_listener_loop() -> None:
                 send_discovery_response()
 
 
+def heartbeat_loop() -> None:
+    while not shutdown_event.wait(heartbeat_wait_secs()):
+        print(
+            f"[sensor_camera] | [Sensor Python:Heartbeat] Renovando presença da frota "
+            f"via DiscoveryResponse."
+        )
+        send_discovery_response()
+
+
 def handle_shutdown_signal(signum, frame) -> None:
     shutdown_event.set()
 
@@ -465,6 +499,7 @@ def main() -> None:
 
     threading.Thread(target=control_server_loop, daemon=True).start()
     threading.Thread(target=multicast_listener_loop, daemon=True).start()
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
 
     send_discovery_response()
 

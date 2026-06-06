@@ -217,17 +217,34 @@ Configure no `docker-compose.yml` sob a chave `environment:` de cada serviço.
 | `TCP_CLIENT_IDLE_TIMEOUT` | `60` | Tempo que uma conexão TCP persistente pode ficar ociosa antes de ser fechada |
 | `TCP_MAX_FRAME_BYTES` | `1048576` | Tamanho máximo aceito para frames TCP do cliente |
 | `DB_POOL_SIZE` | `4` | Tamanho do pool de conexões SQLite |
+| `TELEMETRY_QUEUE_MAXSIZE` | `10000` | Tamanho máximo da fila assíncrona de ingestão antes da escrita em batch |
+| `TELEMETRY_BATCH_MAX_PAYLOADS` | `100` | Quantidade máxima de datagramas por batch de escrita |
+| `TELEMETRY_BATCH_MAX_ROWS` | `500` | Quantidade máxima de linhas métricas por batch de escrita |
+| `TELEMETRY_BATCH_FLUSH_INTERVAL_SECS` | `1.0` | Janela máxima antes de flush do batch, mesmo sem atingir o limite |
+| `METRICS_RAW_RETENTION_SECS` | `604800` | Retenção da tabela bruta `metrics`; `0` desativa expurgo |
+| `ROLLUP_1M_RETENTION_SECS` | `2592000` | Retenção do rollup de 1 minuto; `0` desativa expurgo |
+| `ROLLUP_5M_RETENTION_SECS` | `15552000` | Retenção do rollup de 5 minutos; `0` desativa expurgo |
+| `ROLLUP_1H_RETENTION_SECS` | `0` | Retenção do rollup de 1 hora; `0` mantém indefinidamente |
+| `METRICS_RETENTION_INTERVAL_SECS` | `3600` | Intervalo da rotina de limpeza de dados antigos |
+| `ROLLUP_BACKFILL_ON_STARTUP` | `1` | Popula rollups a partir de dados brutos já existentes no boot |
+| `OLAP_RAW_MAX_WINDOW_SECS` | `3600` | Janela máxima para consultar dados brutos diretamente |
+| `OLAP_1M_MAX_WINDOW_SECS` | `86400` | Janela máxima para usar rollup de 1 minuto |
+| `OLAP_5M_MAX_WINDOW_SECS` | `604800` | Janela máxima para usar rollup de 5 minutos; acima disso usa 1 hora |
 
 ### sensor_clima (C)
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
+| `SENSOR_HEARTBEAT_INTERVAL_SECS` | `10` | Intervalo base para renovar presença no Gateway via `DiscoveryResponse` |
+| `SENSOR_HEARTBEAT_JITTER_SECS` | `2` | Jitter adicional do heartbeat para evitar rajadas sincronizadas |
 | `C_DEVICE_COUNT` | `3` | Número de estações ambientais simuladas |
 
 ### sensor_posto (Lua)
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
+| `SENSOR_HEARTBEAT_INTERVAL_SECS` | `10` | Intervalo base para renovar presença no Gateway via `DiscoveryResponse` |
+| `SENSOR_HEARTBEAT_JITTER_SECS` | `2` | Jitter adicional do heartbeat para evitar rajadas sincronizadas |
 | `LUA_DEVICE_COUNT` | `3` | Número de postes simulados |
 | `LUMINOSITY_LOW_THRESHOLD` | `80` | Limiar inferior que dispara evento imediato de luminosidade |
 | `POWER_CONSUMPTION_THRESHOLD` | `32` | Limiar superior que dispara evento imediato de consumo |
@@ -236,6 +253,8 @@ Configure no `docker-compose.yml` sob a chave `environment:` de cada serviço.
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
+| `SENSOR_HEARTBEAT_INTERVAL_SECS` | `10` | Intervalo base para renovar presença no Gateway via `DiscoveryResponse` |
+| `SENSOR_HEARTBEAT_JITTER_SECS` | `2` | Jitter adicional do heartbeat para evitar rajadas sincronizadas |
 | `JAVA_DEVICE_COUNT` | `3` | Número de semáforos simulados |
 | `TRAFFIC_QUEUE_THRESHOLD` | `35` | Limiar de fila veicular que dispara evento imediato |
 
@@ -243,6 +262,8 @@ Configure no `docker-compose.yml` sob a chave `environment:` de cada serviço.
 
 | Variável | Padrão | Descrição |
 |----------|--------|-----------|
+| `SENSOR_HEARTBEAT_INTERVAL_SECS` | `10` | Intervalo base para renovar presença no Gateway via `DiscoveryResponse` |
+| `SENSOR_HEARTBEAT_JITTER_SECS` | `2` | Jitter adicional do heartbeat para evitar rajadas sincronizadas |
 | `CAMERA_DEVICE_COUNT` | `3` | Número de câmeras simuladas |
 | `TRAFFIC_VEHICLES_THRESHOLD` | `80` | Limiar de veículos por minuto que dispara evento imediato |
 | `TRAFFIC_INFRACTIONS_THRESHOLD` | `3` | Limiar de infrações que dispara evento imediato |
@@ -310,7 +331,7 @@ Mensagens principais:
 
 | Mensagem | Direção | Canal |
 |----------|---------|-------|
-| `DiscoveryResponse` | Sensor → Gateway | UDP :5002 |
+| `DiscoveryResponse` | Sensor → Gateway | UDP :5002 (boot, heartbeat e recovery) |
 | `DataPayload` | Sensor → Gateway | UDP :5000 |
 | `ConfigCommand` | Gateway → Sensor | TCP :500x |
 | `ConfigResponse` | Sensor → Gateway | TCP :500x |
@@ -333,6 +354,21 @@ Toda comunicação TCP usa prefixo de 4 bytes Big-Endian:
 Cada mensagem carrega `message_id` único. O gateway detecta e descarta:
 - **Mensagens duplicadas** — mesmo `device_id` + `timestamp` + `message_id`
 - **Mensagens atrasadas** — `timestamp` anterior ao último processado do mesmo dispositivo
+
+### Persistência, Rollups e Retenção
+
+A ingestão UDP passa por uma fila assíncrona e é persistida em batch. O mesmo commit grava a tabela bruta `metrics` e atualiza rollups incrementais:
+
+| Tabela | Granularidade | Uso |
+|--------|---------------|-----|
+| `metrics` | evento bruto | janelas curtas e inspeção detalhada |
+| `metrics_rollup_1m` | 1 minuto | consultas OLAP médias |
+| `metrics_rollup_5m` | 5 minutos | consultas OLAP longas |
+| `metrics_rollup_1h` | 1 hora | histórico de longo prazo |
+
+Cada rollup guarda `sample_count`, soma, soma dos quadrados, mínimo e máximo. Com isso o gateway calcula média, desvio padrão e maior variação sem varrer milhões de linhas brutas.
+
+O gateway também executa retenção periódica: dados brutos ficam limitados por `METRICS_RAW_RETENTION_SECS`, enquanto os rollups têm políticas independentes.
 
 ---
 
@@ -399,6 +435,13 @@ Parâmetros:
 - **Métrica alvo** — 12 disponíveis (ver catálogo acima)
 - **Janela temporal** — últimas 1 a 24 horas
 
+O gateway escolhe automaticamente a fonte da consulta:
+- janelas curtas usam `metrics`;
+- janelas médias usam `metrics_rollup_1m`;
+- janelas longas usam `metrics_rollup_5m` ou `metrics_rollup_1h`.
+
+Se uma base antiga ainda não tiver rollups preenchidos, o gateway faz fallback para a tabela bruta para preservar compatibilidade.
+
 ---
 
 ## Resiliência de Rede
@@ -418,6 +461,10 @@ Tentativa 3 →  800 ms + jitter aleatório  (máx. 1500 ms)
 O gateway transmite `SMARTCITY_DISCOVERY_PROBE` via multicast `239.0.0.1:5005` a cada 15 segundos por padrão.
 Todos os sensores escutam o grupo e re-enviam `DiscoveryResponse`, garantindo recuperação após reinicialização do gateway sem intervenção manual. A porta multicast é dedicada para não misturar probes de recovery com telemetria `DataPayload` em `5000/UDP`.
 
+### Heartbeat de presença
+
+Além da telemetria, cada sensor reenvia `DiscoveryResponse` periodicamente a cada `10s + jitter de 0 a 2s` por padrão. O gateway trata esse pacote como renovação de presença/topologia, atualiza `last_seen` com UPSERT e registra log detalhado apenas em nível `DEBUG` para heartbeats de dispositivos já conhecidos.
+
 ### Jitter de telemetria
 
 Cada ciclo de envio inclui atraso aleatório (até ±350 ms) para evitar sincronização de envios em frotas grandes e reduzir colisões UDP.
@@ -435,7 +482,7 @@ Além do envio periódico, os sensores simulam amostras intermediárias e emitem
 
 ### Detecção automática de offline
 
-O gateway marca dispositivos sem pacotes recentes como `STATUS_OFF` usando `DEVICE_OFFLINE_TIMEOUT_SECS`. Como os IDs agora são estáveis, reiniciar um sensor atualiza o mesmo registro no SQLite em vez de criar uma nova chave fantasma.
+O gateway marca dispositivos sem `last_seen` recente como `STATUS_OFF` usando `DEVICE_OFFLINE_TIMEOUT_SECS`. Como os IDs agora são estáveis e os sensores possuem heartbeat explícito, reiniciar um sensor atualiza o mesmo registro no SQLite em vez de criar uma nova chave fantasma.
 
 ### Graceful Shutdown
 
