@@ -52,7 +52,7 @@ O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclu
 │  └──────────────────┘                    ┌──────────────────────┐ │
 │                                          │     dashboard        │ │
 │  ←── Multicast 239.0.0.1 ────────────────│  Streamlit :8501     │ │
-│       Recovery Probes (UDP :5000)        └──────────────────────┘ │
+│       Recovery Probes (UDP :5005)        └──────────────────────┘ │
 └────────────────────────────────────────────────────────────────────┘
                                                     │ :8501
                                                     ▼
@@ -147,7 +147,7 @@ Se o terminal ainda não reconhecer `podman` após a instalação, ou se você e
 
 ### Acessar o dashboard
 
-Após a inicialização (aguarde o healthcheck do gateway ser aprovado):
+Após a inicialização (aguarde os healthchecks dos serviços ficarem saudáveis):
 
 ```
 http://localhost:8501
@@ -195,7 +195,7 @@ podman exec gateway sqlite3 db/smartcity_gateway.db \
 | `sensor_posto` | 5002 | TCP | Servidor de controle (Lua) |
 | `sensor_semaforo` | 5003 | TCP | Servidor de controle (Java) |
 | `sensor_camera` | 5004 | TCP | Servidor de controle (Python) |
-| Multicast | 5000 | UDP | Grupo 239.0.0.1 — probes de recovery |
+| Multicast | 5005 | UDP | Grupo 239.0.0.1 — probes de recovery |
 
 > O sensor C não possui porta TCP — opera exclusivamente como emissor UDP.
 
@@ -415,8 +415,8 @@ Tentativa 3 →  800 ms + jitter aleatório  (máx. 1500 ms)
 
 ### Redescoberta automática (Multicast Recovery)
 
-O gateway transmite `SMARTCITY_DISCOVERY_PROBE` via multicast `239.0.0.1:5000` a cada 15 segundos por padrão.
-Todos os sensores escutam o grupo e re-enviam `DiscoveryResponse`, garantindo recuperação após reinicialização do gateway sem intervenção manual.
+O gateway transmite `SMARTCITY_DISCOVERY_PROBE` via multicast `239.0.0.1:5005` a cada 15 segundos por padrão.
+Todos os sensores escutam o grupo e re-enviam `DiscoveryResponse`, garantindo recuperação após reinicialização do gateway sem intervenção manual. A porta multicast é dedicada para não misturar probes de recovery com telemetria `DataPayload` em `5000/UDP`.
 
 ### Jitter de telemetria
 
@@ -493,5 +493,5 @@ projeto-sockets/
 - **Sensor C multi-frota** registra e envia telemetria para N dispositivos no mesmo processo, com `pthread` dedicada ao listener multicast
 - **Sensor Lua** implementa scheduling cooperativo manual (sem threads) via `socket.sleep` e timestamps de controle
 - **Sensor Java** usa `volatile` nos campos de estado para segurança entre threads sem overhead de `synchronized` completo
-- **Healthcheck** garante que o TCP :5001 do gateway responda antes de os sensores iniciarem, enquanto os probes multicast periódicos permitem re-sincronização caso algum runtime Compose inicie serviços fora da ordem esperada
+- **Healthchecks** verificam o TCP :5001 do gateway, as portas TCP dos sensores controláveis, a porta web do dashboard e o processo do sensor C; os probes multicast periódicos permitem re-sincronização caso algum runtime Compose inicie serviços fora da ordem esperada
 - **Dockerfile raiz** replica os builds dos serviços como estágios nomeados para contornar providers Podman Compose que ignoram `build.dockerfile`

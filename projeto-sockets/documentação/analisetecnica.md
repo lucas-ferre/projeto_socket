@@ -1,793 +1,151 @@
-# Análise Técnica Unificada do Sistema Distribuído Smart City 
+# Análise Técnica Unificada do Sistema Distribuído Smart City
 
-# 1. Visão Geral
+## 1. Visão Geral
 
-O sistema implementa uma arquitetura distribuída orientada a eventos voltada para monitoramento e controle de dispositivos em um cenário de Smart City.
+O projeto implementa uma plataforma distribuída de monitoramento urbano no modelo Hub-and-Spoke. Sensores heterogêneos enviam telemetria e descoberta para um gateway central, que persiste os dados em SQLite e atende o dashboard Streamlit por TCP.
 
-A plataforma é composta por:
+Componentes principais:
 
-* Gateway Central;
-* Sensores distribuídos multi-linguagem;
-* Dashboard analítico em Streamlit;
-* Comunicação híbrida UDP/TCP;
-* Persistência SQLite;
-* Serialização via Protocol Buffers;
-* Infraestrutura conteinerizada com Docker ou Podman.
+* Gateway Python com `asyncio`, UDP, TCP persistente e SQLite WAL;
+* sensores em C, Lua, Java e Python;
+* dashboard Streamlit com descoberta, controle, OLAP e inspeção individual;
+* contrato Protocol Buffers compartilhado;
+* orquestração por Docker Compose ou Podman Compose.
 
-A solução demonstra integração entre:
+## 2. Arquitetura de Rede Atual
 
-* redes distribuídas;
-* sistemas concorrentes;
-* protocolos de comunicação;
-* telemetria em tempo real;# Análise Técnica Unificada do Sistema Distribuído Smart City
+| Função | Transporte | Porta | Observação |
+|---|---:|---:|---|
+| Telemetria | UDP | 5000 | Exclusiva para `DataPayload` dos sensores para o gateway |
+| Cliente/Gateway | TCP | 5001 | Dashboard envia `ClientRequest` e recebe `ClientResponse` |
+| Descoberta | UDP | 5002 | Sensores enviam `DiscoveryResponse` ao gateway |
+| Controle Lua | TCP | 5002 | Gateway encaminha `ConfigCommand` para o sensor Lua |
+| Controle Java | TCP | 5003 | Gateway encaminha `ConfigCommand` para o sensor Java |
+| Controle Python | TCP | 5004 | Gateway encaminha `ConfigCommand` para o sensor Python |
+| Recovery multicast | UDP | 5005 | Gateway envia `SMARTCITY_DISCOVERY_PROBE` para `239.0.0.1` |
+| Dashboard web | HTTP/TCP | 8501 | Interface Streamlit exposta ao host |
 
-# 1. Visão Geral
+A porta `5000/UDP` ficou dedicada à telemetria. O multicast de recovery usa `5005/UDP`, evitando mistura entre probes e métricas.
 
-O sistema implementa uma arquitetura distribuída orientada a eventos voltada para monitoramento e controle de dispositivos em um cenário de Smart City.
+## 3. Contrato Protocol Buffers
 
-A plataforma é composta por:
+Mensagens operacionais:
 
-* Gateway Central;
-* Sensores distribuídos multi-linguagem;
-* Dashboard analítico em Streamlit;
-* Comunicação híbrida UDP/TCP;
-* Persistência SQLite;
-* Serialização via Protocol Buffers;
-* Infraestrutura conteinerizada com Docker ou Podman.
+* `DiscoveryResponse`: anúncio de topologia e presença.
+* `DataPayload`: telemetria, status corrente e métricas.
+* `ConfigCommand`: comando remoto do gateway para sensores controláveis.
+* `ConfigResponse`: confirmação de atuação.
+* `ClientRequest` e `ClientResponse`: comunicação dashboard/gateway.
 
-A solução demonstra integração entre:
+O antigo ramo `SensorData/sequence` foi removido. A telemetria real do sistema é `DataPayload`; a idempotência no gateway usa `device_id`, `timestamp` e `message_id`.
 
-* redes distribuídas;
-* sistemas concorrentes;
-* protocolos de comunicação;
-* telemetria em tempo real;
-* persistência de dados;
-* interoperabilidade heterogênea.
+## 4. Gateway
 
----
+O gateway concentra:
 
-# 2. Arquitetura Geral
+* ingestão UDP assíncrona de telemetria;
+* descoberta UDP;
+* servidor TCP persistente para o dashboard;
+* proxy TCP para sensores controláveis;
+* persistência SQLite com WAL;
+* pool assíncrono de conexões;
+* monitor de offline automático;
+* probes multicast periódicos;
+* checkpoint periódico do WAL.
 
-A arquitetura segue um modelo centralizado do tipo Hub-and-Spoke:
+O servidor TCP do cliente aceita múltiplos frames na mesma conexão. Isso reduz handshakes TCP, evita thrashing de sockets e permite keep-alive controlado por `TCP_CLIENT_IDLE_TIMEOUT`.
 
-```text
-Sensores -> Gateway -> Dashboard
-```
+## 5. Persistência
 
-O Gateway atua como núcleo operacional da plataforma.
+O banco `smartcity_gateway.db` possui duas tabelas principais:
 
-Ele é responsável por:
+* `devices`: inventário, tipo, status, IP, porta de controle, controlabilidade e `last_seen`.
+* `metrics`: séries temporais de métricas por dispositivo.
+
+O índice `idx_metrics(metric_name, timestamp)` acelera consultas OLAP por janela temporal.
+
+## 6. Presença e Offline Automático
+
+O gateway atualiza `last_seen` quando recebe descoberta ou telemetria. Uma task periódica marca dispositivos como `STATUS_OFF` quando ficam mais de `DEVICE_OFFLINE_TIMEOUT_SECS` sem pacote recente.
+
+Os sensores usam IDs estáveis por tipo, setor e ordinal, por exemplo:
+
+* `estacao_pici_01`;
+* `poste_benfica_01`;
+* `semaforo_porangabussu_01`;
+* `camera_pici_01`.
+
+Isso evita dispositivos fantasmas no SQLite após reboot do container.
+
+## 7. Sensores
+
+| Sensor | Linguagem | Tipo | Controle | Métricas |
+|---|---|---|---|---|
+| `sensor_clima` | C | Estação ambiental | Não | `temperature`, `humidity`, `co2`, `pm25`, `pm10`, `aqi` |
+| `sensor_posto` | Lua | Poste inteligente | TCP 5002 | `luminosity`, `power_consumption` |
+| `sensor_semaforo` | Java | Semáforo | TCP 5003 | `state`, `queue_length` |
+| `sensor_camera` | Python | Câmera de tráfego | TCP 5004 | `vehicles_count`, `infractions` |
+
+Todos enviam `DiscoveryResponse` em `5002/UDP` e `DataPayload` em `5000/UDP`.
+
+## 8. Envio Periódico e Eventos por Limiar
+
+Além da telemetria periódica com jitter, os sensores simulam amostras intermediárias e enviam imediatamente quando um limiar relevante é cruzado.
+
+| Sensor | Limiar de evento |
+|---|---|
+| C / Estação ambiental | `temperature >= 32`, `pm25 >= 35` ou `aqi >= 100` |
+| Lua / Poste | `luminosity <= 80` ou `power_consumption >= 32` |
+| Java / Semáforo | `queue_length >= 35` |
+| Python / Câmera | `vehicles_count >= 80` ou `infractions >= 3` |
+
+Os envios por limiar usam cooldown de 3 segundos para evitar rajadas.
+
+## 9. Multicast Recovery e Mitigação de Thundering Herd
+
+O gateway envia `SMARTCITY_DISCOVERY_PROBE` para `239.0.0.1:5005`. Ao receber o probe, cada sensor aguarda jitter aleatório de 0 a 2000 ms antes de reenviar `DiscoveryResponse`.
+
+Esse atraso randômico evita que todos os sensores reanunciem simultaneamente e reduz risco de saturação do buffer UDP do gateway.
+
+## 10. Dashboard
+
+O dashboard Streamlit oferece:
 
 * descoberta de dispositivos;
-* recepção de telemetria;
-* roteamento de comandos;
-* persistência;
-* agregações analíticas;
-* coordenação geral do sistema.
+* painel de atuação contextual;
+* consultas OLAP;
+* inspeção individual por sensor;
+* histórico de comandos;
+* reuso de conexão TCP persistente com o gateway.
 
-A centralização reduz:
+O cliente diferencia falhas como timeout, conexão recusada, frame inválido, erro Protobuf e erro de socket. A aba de comandos envia requisições em background para evitar congelamento da UI.
 
-* complexidade distribuída;
-* acoplamento entre sensores;
-* sincronização peer-to-peer.
+## 11. Healthchecks
 
-Entretanto, introduz:
+Todos os serviços possuem healthchecks no Compose:
 
-* ponto único de falha;
-* gargalo centralizado;
-* dependência operacional do Gateway.
+* gateway: TCP `5001`;
+* sensor Lua: TCP `5002`;
+* sensor Java: TCP `5003`;
+* sensor Python: TCP `5004`;
+* dashboard: TCP `8501`;
+* sensor C: processo `sensor_c` vivo.
 
----
+## 12. Limitações Atuais
 
-# 3. Camada de Comunicação
-
-## 3.1 Segmentação de Protocolos
-
-O sistema separa responsabilidades de rede utilizando protocolos distintos:
-
-| Função     | Transporte | Porta |
-| ---------- | ---------- | ----- |
-| Telemetria | UDP        | 5000  |
-| Controle   | TCP        | 5001  |
-| Descoberta | UDP        | 5002  |
-| Dashboard  | HTTP       | 8501  |
-
-Essa divisão é tecnicamente adequada.
-
-UDP foi corretamente utilizado para:
-
-* telemetria contínua;
-* baixa latência;
-* redução de overhead;
-* comunicação não-crítica.
-
-TCP foi reservado para:
-
-* comandos críticos;
-* consistência de entrega;
-* streams confiáveis.
-
----
-
-# 4. Serialização com Protocol Buffers
-
-O sistema utiliza Protocol Buffers como padrão de serialização binária.
-
-Essa decisão proporciona:
-
-* interoperabilidade multi-linguagem;
-* payloads compactos;
-* alta eficiência de rede;
-* contratos rígidos de comunicação.
-
-A solução permite que sensores implementados em linguagens diferentes compartilhem o mesmo protocolo.
-
----
-
-# 5. Gateway Central
-
-## 5.1 Responsabilidades
-
-O Gateway representa o componente mais complexo da arquitetura.
-
-Ele implementa:
-
-* servidores UDP assíncronos;
-* servidor TCP;
-* processamento de telemetria;
-* descoberta de dispositivos;
-* persistência SQLite;
-* consultas analíticas;
-* controle distribuído.
-
-Arquiteturalmente, atua simultaneamente como:
-
-* coordinator;
-* message broker;
-* ingestion hub;
-* analytics node.
-
----
-
-# 6. Modelo de Concorrência
-
-## 6.1 Uso de asyncio
-
-O Gateway utiliza programação assíncrona baseada em asyncio.
-
-Essa abordagem é adequada porque o sistema é predominantemente I/O-bound.
-
-Os principais mecanismos utilizados incluem:
-
-* asyncio.start_server;
-* create_datagram_endpoint;
-* background tasks;
-* aiosqlite.
-
-A arquitetura evita:
-
-* excesso de threads;
-* overhead de context switching;
-* bloqueios desnecessários.
-
----
-
-# 7. Persistência de Dados
-
-## 7.1 SQLite com WAL
-
-O banco SQLite opera em modo WAL:
-
-```sql
-PRAGMA journal_mode=WAL;
-```
-
-Essa configuração melhora:
-
-* concorrência de leitura;
-* throughput;
-* coexistência entre leitores e escritores.
-
----
-
-## 7.2 Pool Assíncrono de Conexões
-
-O sistema implementa pool manual de conexões SQLite.
-
-Características:
-
-* reutilização de conexões;
-* queue assíncrona;
-* rollback automático;
-* foreign keys habilitadas;
-* busy_timeout configurado.
-
-A implementação demonstra preocupação com:
-
-* contenção;
-* estabilidade;
-* gerenciamento transacional.
-
----
-
-## 7.3 Modelagem
-
-### devices
-
-Tabela responsável por:
-
-* inventário;
-* status;
-* descoberta;
-* controle.
-
-### metrics
-
-Tabela responsável por:
-
-* séries temporais;
-* armazenamento de telemetria;
-* consultas analíticas.
-
----
-
-## 7.4 Indexação
-
-O sistema utiliza índice:
-
-```sql
-CREATE INDEX idx_metrics
-ON metrics(metric_name, timestamp)
-```
-
-Isso reduz:
-
-* full scans;
-* degradação temporal;
-* custo de agregações.
-
----
-
-# 8. Pipeline de Telemetria
-
-Fluxo operacional:
-
-```text
-Sensor -> UDP -> Gateway -> SQLite -> Dashboard
-```
-
-O Gateway executa:
-
-1. recepção do datagrama;
-2. desserialização;
-3. validação;
-4. detecção de duplicidade;
-5. controle de sequência;
-6. persistência assíncrona.
-
----
-
-## 8.1 Controle de Duplicidade
-
-O sistema mantém rastreamento de:
-
-* timestamps;
-* message_id.
-
-Isso evita:
-
-* replay;
-* duplicação;
-* inconsistências temporais.
-
----
-
-## 8.2 Controle de Sequência
-
-O Gateway detecta perdas utilizando controle de sequência.
-
-A lógica compara:
-
-```text
-sequência esperada vs sequência recebida
-```
-
-Isso permite:
-
-* detecção de packet loss;
-* auditoria de integridade;
-* monitoramento da qualidade da rede.
-
----
-
-# 9. Descoberta de Dispositivos
-
-Os sensores anunciam presença via UDP.
-
-O Gateway registra:
-
-* IP;
-* porta;
-* tipo;
-* status;
-* capacidade de controle.
-
-O sistema também utiliza multicast:
-
-```text
-239.0.0.1
-```
-
-Esse mecanismo permite:
-
-* descoberta dinâmica;
-* reanúncio;
-* sincronização da topologia.
-
----
-
-# 10. Sensor Python
-
-## 10.1 Características Gerais
-
-O sensor Python é o componente mais sofisticado da plataforma.
-
-Ele implementa:
-
-* múltiplos dispositivos virtuais;
-* multicast;
-* controle TCP;
-* telemetria dinâmica;
-* jitter;
-* retry exponencial;
-* override manual;
-* threads concorrentes.
-
----
-
-## 10.2 Retry Exponencial
-
-O sensor implementa backoff exponencial.
-
-Isso reduz:
-
-* tempestades de retransmissão;
-* saturação de rede;
-* loops agressivos de falha.
-
----
-
-## 10.3 Jitter Aleatório
-
-O jitter evita:
-
-* sincronização artificial;
-* bursts simultâneos;
-* congestionamentos periódicos.
-
----
-
-## 10.4 Controle TCP
-
-O sensor utiliza:
-
-* framing binário;
-* readexact;
-* validação de tamanho;
-* timeout.
-
-Isso evita:
-
-* partial reads;
-* corrupção de stream;
-* fragmentação incorreta.
-
----
-
-# 11. Sensor em C
-
-## 11.1 Características Gerais
-
-O sensor em C representa o componente mais próximo de um ambiente embarcado real.
-
-A implementação demonstra:
-
-* manipulação direta de sockets;
-* controle explícito de memória;
-* serialização binária;
-* baixo overhead operacional.
-
----
-
-## 11.2 Comunicação de Rede
-
-O sensor utiliza sockets BSD tradicionais.
-
-Isso exige:
-
-* gerenciamento manual de buffers;
-* controle explícito de recv/send;
-* manipulação direta de sockaddr.
-
-A implementação demonstra domínio de programação de rede em baixo nível.
-
----
-
-## 11.3 Retry e Resiliência
-
-O sensor implementa:
-
-* retry automático;
-* backoff exponencial;
-* jitter aleatório;
-* retry de DNS;
-* retry de envio UDP.
-
-A lógica inclui:
-
-```c
-retry_delay_usec()
-```
-
-O sistema também utiliza:
-
-```c
-send_udp_with_retry()
-```
-
-Essa estratégia melhora significativamente a tolerância a falhas transitórias.
-
----
-
-## 11.4 Eficiência
-
-Entre todos os sensores, o módulo em C possui:
-
-* menor footprint;
-* menor latência;
-* maior eficiência computacional.
-
-Ele é particularmente adequado para:
-
-* edge computing;
-* dispositivos embarcados;
-* ambientes restritos.
-
----
-
-# 12. Sensor Java
-
-## 12.1 Estrutura Arquitetural
-
-O sensor Java apresenta uma arquitetura mais orientada a objetos.
-
-Características:
-
-* encapsulamento;
-* abstração;
-* separação de responsabilidades;
-* modularização.
-
----
-
-## 12.2 Modelo de Execução
-
-A JVM fornece:
-
-* garbage collection;
-* gerenciamento automático de memória;
-* abstrações robustas de socket.
-
-Isso reduz:
-
-* vazamentos;
-* corrupção de memória;
-* falhas estruturais.
-
-Por outro lado, aumenta:
-
-* consumo de RAM;
-* overhead de runtime.
-
----
-
-## 12.3 Robustez
-
-O sensor Java é um dos componentes mais robustos em:
-
-* estabilidade;
-* tratamento de exceções;
-* manutenção;
-* extensibilidade.
-
----
-
-# 13. Sensor Lua
-
-## 13.1 Natureza do Sensor
-
-O sensor Lua representa o componente mais leve em termos de scripting.
-
-Lua é adequada para:
-
-* automação;
-* edge scripting;
-* sistemas IoT;
-* integração embarcada.
-
----
-
-## 13.2 Footprint
-
-O runtime Lua possui:
-
-* footprint reduzido;
-* inicialização rápida;
-* baixo consumo de memória.
-
----
-
-## 13.3 Limitações
-
-Comparado aos outros sensores, o módulo Lua possui:
-
-* menor estruturação arquitetural;
-* menor tipagem;
-* menor verificabilidade estática.
-
-Isso reduz:
-
-* segurança estrutural;
-* escalabilidade de manutenção.
-
----
-
-# 14. Dashboard Streamlit
-
-## 14.1 Papel Operacional
-
-O dashboard Streamlit atua como:
-
-* console operacional;
-* painel analítico;
-* centro de monitoramento;
-* interface de controle.
-
----
-
-## 14.2 Sessão Persistente
-
-O uso de:
-
-```python
-st.session_state
-```
-
-permite:
-
-* persistência de estado;
-* cache local;
-* histórico operacional.
-
----
-
-## 14.3 Interface Contextual
-
-A interface adapta:
-
-* comandos;
-* labels;
-* status;
-* controles.
-
-conforme o tipo de dispositivo.
-
----
-
-# 15. Consultas Analíticas
-
-O sistema suporta:
-
-* média;
-* desvio padrão;
-* filtragem temporal.
-
-As consultas são executadas diretamente no SQLite.
-
----
-
-## 15.1 Limitações Analíticas
-
-O subsistema analítico ainda possui limitações.
-
-Ausências importantes:
-
-* percentis;
-* mediana;
-* histogramas;
-* séries temporais avançadas;
-* detecção de anomalias;
-* janelas deslizantes.
-
----
-
-# 16. Conteinerização
-
-O sistema utiliza:
-
-* Docker ou Podman;
-* Docker Compose ou Podman Compose;
-* bridge network;
-* healthchecks.
-
-Isso melhora:
-
-* isolamento;
-* reprodutibilidade;
-* portabilidade;
-* orquestração.
-
----
-
-# 17. Avaliação Multi-Linguagem
-
-A coexistência entre:
-
-* Python;
-* C;
-* Java;
-* Lua.
-
-é um dos aspectos mais sofisticados do projeto.
-
-Isso demonstra:
-
-* independência de linguagem;
-* desacoplamento arquitetural;
-* padronização protocolar;
-* interoperabilidade real.
-
----
-
-# 18. Segurança
-
-O sistema não implementa:
+O sistema ainda não implementa:
 
 * autenticação;
 * autorização;
 * TLS;
 * assinatura de mensagens;
-* criptografia.
+* criptografia;
+* replicação do gateway;
+* banco distribuído;
+* fila persistente de eventos.
 
-Isso representa uma limitação crítica para ambientes reais.
+O gateway ainda é ponto único de falha, e SQLite é adequado para o escopo acadêmico/local, mas não para alta escala.
 
----
+## 13. Conclusão Técnica
 
-# 19. Escalabilidade
-
-SQLite limita:
-
-* throughput;
-* concorrência massiva;
-* escalabilidade horizontal.
-
-Em produção, seriam recomendados:
-
-* PostgreSQL;
-* TimescaleDB;
-* InfluxDB;
-* Kafka.
-
----
-
-# 20. Tolerância a Falhas
-
-Atualmente não existem:
-
-* failover;
-* replicação;
-* consenso distribuído;
-* persistência distribuída.
-
-O Gateway permanece como ponto único de falha.
-
----
-
-# 21. Complexidade Computacional
-
-## Ingestão UDP
-
-```text
-O(1)
-```
-
-por pacote.
-
----
-
-## Inserção no Banco
-
-```text
-O(log n)
-```
-
-considerando indexação.
-
----
-
-## Consultas Analíticas
-
-```text
-O(k)
-```
-
-onde:
-
-```text
-k = quantidade de registros filtrados
-```
-
----
-
-# 22. Principais Melhorias
-
-## Curto Prazo
-
-* autenticação;
-* TLS;
-* heartbeat dedicado;
-* retries inteligentes;
-* monitoramento de saúde.
-
----
-
-## Médio Prazo
-
-* PostgreSQL/TimescaleDB;
-* Prometheus;
-* Grafana;
-* filas Kafka/RabbitMQ.
-
----
-
-## Longo Prazo
-
-* clusterização do Gateway;
-* replicação;
-* consenso distribuído;
-* stream analytics.
-
----
-
-# 23. Conclusão Técnica
-
-O sistema implementa uma plataforma distribuída de Smart City.
-
-A solução demonstra domínio de:
-
-* sistemas distribuídos;
-* redes;
-* telemetria;
-* comunicação binária;
-* concorrência;
-* interoperabilidade multi-linguagem;
-* persistência;
-* engenharia de protocolos.
-
-Os componentes mais sofisticados do projeto incluem:
-
-* Gateway assíncrono;
-* framing TCP;
-* controle de sequência;
-* retry exponencial;
-* descoberta multicast;
-* interoperabilidade heterogênea.
-
-Apesar das limitações relacionadas a:
-
-* segurança;
-* escalabilidade;
-* tolerância a falhas;
-* persistência distribuída;
-
-o sistema já apresenta características compatíveis com arquiteturas reais de edge computing e IoT distribuída.
+O sistema atual apresenta uma arquitetura coerente para simulação de IoT urbana distribuída. As evoluções recentes corrigiram pontos importantes: remoção de código morto, IDs estáveis, offline automático, eventos por limiar, porta multicast dedicada, jitter de recovery, conexão TCP persistente, healthchecks e inspeção individual no dashboard.

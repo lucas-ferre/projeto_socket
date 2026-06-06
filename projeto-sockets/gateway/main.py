@@ -71,6 +71,7 @@ TCP_CLIENT_IDLE_TIMEOUT = max(
 TCP_MAX_FRAME_BYTES = max(1024, int(os.getenv("TCP_MAX_FRAME_BYTES", str(1024 * 1024))))
 
 MULTICAST_GROUP          = "239.0.0.1"
+MULTICAST_PORT           = 5005
 DISCOVERY_PROBE_PAYLOAD  = b"SMARTCITY_DISCOVERY_PROBE"
 DISCOVERY_PROBE_INTERVAL_SECS = max(1.0, float(os.getenv("DISCOVERY_PROBE_INTERVAL_SECS", "15")))
 MULTICAST_TTL            = max(1, int(os.getenv("MULTICAST_TTL", "1")))
@@ -320,10 +321,10 @@ async def multicast_discovery_probe_loop():
 
             while True:
                 try:
-                    sock.sendto(DISCOVERY_PROBE_PAYLOAD, (MULTICAST_GROUP, UDP_TELEMETRY_PORT))
+                    sock.sendto(DISCOVERY_PROBE_PAYLOAD, (MULTICAST_GROUP, MULTICAST_PORT))
                     log.debug(
                         "Probe de descoberta enviado para %s:%d.",
-                        MULTICAST_GROUP, UDP_TELEMETRY_PORT,
+                        MULTICAST_GROUP, MULTICAST_PORT,
                     )
                 except OSError as exc:
                     log.warning("Falha ao enviar probe de descoberta: %s", exc)

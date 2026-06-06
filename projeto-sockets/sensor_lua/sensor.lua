@@ -28,11 +28,12 @@ local GATEWAY_HOST           = "gateway"
 local GATEWAY_TELEMETRY_PORT = 5000
 local GATEWAY_DISCOVERY_PORT = 5002
 local MULTICAST_GROUP        = "239.0.0.1"
-local MULTICAST_PORT         = 5000
+local MULTICAST_PORT         = 5005
 local UDP_MAX_RETRIES        = 3
 local RETRY_BASE_DELAY       = 0.20
 local RETRY_MAX_DELAY        = 1.50
 local TELEMETRY_JITTER_SECS  = 0.35
+local DISCOVERY_PROBE_JITTER_SECS = 2.0
 local MAX_TCP_FRAME_BYTES    = 1024 * 1024
 local MANUAL_OVERRIDE_SECS   = 30.0
 local THRESHOLD_SCAN_INTERVAL_SECS = 1.0
@@ -128,6 +129,10 @@ print(string.format("[Sensor Lua:TCP] Interface de controle provisionada na port
 local function retry_delay(attempt)
     local backoff = math.min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2 ^ (attempt - 1)))
     return backoff + (math.random() * RETRY_BASE_DELAY)
+end
+
+local function discovery_probe_jitter()
+    return math.random() * DISCOVERY_PROBE_JITTER_SECS
 end
 
 local function random_device_status()
@@ -427,7 +432,11 @@ end
 local function poll_multicast_probes()
     local data, peer_ip = udp_mc:receivefrom()
     if data and data == "SMARTCITY_DISCOVERY_PROBE" then
-        print(string.format("[Sensor Lua:Multicast] Probe rastreado via %s. Injetando sincronização!", peer_ip))
+        local delay = discovery_probe_jitter()
+        print(string.format(
+            "[Sensor Lua:Multicast] Probe rastreado via %s. Injetando sincronização em %.0f ms!",
+            peer_ip, delay * 1000))
+        socket.sleep(delay)
         send_discovery_response()
     end
 end

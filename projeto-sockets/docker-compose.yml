@@ -50,6 +50,15 @@ services:
     networks:
       - smart_city_net
     restart: on-failure
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "test -r /proc/1/cmdline && grep -zq sensor_c /proc/1/cmdline"
+      ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   # ==================================================================
   # 3. POSTE INTELIGENTE (NÓ LUA - CONTROLÁVEL)
@@ -68,6 +77,15 @@ services:
     networks:
       - smart_city_net
     restart: on-failure
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "bash -c '</dev/tcp/127.0.0.1/5002'"
+      ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
 # ==================================================================
   # 4. SEMAFORO (NÓ JAVA - CONTÍNUO)
@@ -85,6 +103,15 @@ services:
     networks:
       - smart_city_net
     restart: on-failure
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "bash -c '</dev/tcp/127.0.0.1/5003'"
+      ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   # ==================================================================
   # 5. CÂMERA DE TRÁFEGO (NÓ PYTHON - CONTROLÁVEL)
@@ -104,6 +131,15 @@ services:
     networks:
       - smart_city_net
     restart: on-failure
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "python -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1.0); s.connect((\"127.0.0.1\", 5004)); s.close()' || exit 1"
+      ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   # ==================================================================
   # 6. CLIENTE ANALÍTICO (DASHBOARD STREAMLIT)
@@ -123,6 +159,15 @@ services:
     networks:
       - smart_city_net
     restart: on-failure
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "python -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1.0); s.connect((\"127.0.0.1\", 8501)); s.close()' || exit 1"
+      ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
 networks:
   smart_city_net:

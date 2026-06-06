@@ -42,11 +42,12 @@ public class sensor {
     
     private static final int CONTROL_TCP_PORT = 5003;
     private static final String MULTICAST_GROUP = "239.0.0.1";
-    private static final int MULTICAST_PORT = 5000;
+    private static final int MULTICAST_PORT = 5005;
     private static final int UDP_MAX_RETRIES = 3;
     private static final long RETRY_BASE_DELAY_MS = 200L;
     private static final long RETRY_MAX_DELAY_MS = 1500L;
     private static final long TELEMETRY_JITTER_MS = 350L;
+    private static final long DISCOVERY_PROBE_JITTER_MS = 2_000L;
     private static final int MAX_TCP_FRAME_BYTES = 1024 * 1024;
     private static final long MANUAL_OVERRIDE_MS = 30_000L;
     private static final long THRESHOLD_SCAN_INTERVAL_MS = 1_000L;
@@ -149,6 +150,18 @@ public class sensor {
         System.err.println("[Java:Retry] UDP " + channel + " falhou (tentativa "
             + (attempt + 1) + "/" + UDP_MAX_RETRIES + "): " + e.getMessage()
             + ". Retry em " + delay + "ms.");
+        try {
+            Thread.sleep(delay);
+            return true;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private static boolean waitDiscoveryProbeJitter() {
+        long delay = RNG.nextInt((int) DISCOVERY_PROBE_JITTER_MS + 1);
+        System.out.println("[Java:Multicast] Jitter de redescoberta: " + delay + " ms.");
         try {
             Thread.sleep(delay);
             return true;
@@ -318,7 +331,10 @@ public class sensor {
                 
                 String probeData = new String(p.getData(), 0, p.getLength());
                 if (probeData.equals("SMARTCITY_DISCOVERY_PROBE")) {
-                    System.out.println("[Java:Multicast] Probe de recuperação detectado. Re-sincronizando topologia!");
+                    System.out.println("[Java:Multicast] Probe de recuperação detectado. Re-sincronizando topologia com jitter!");
+                    if (!waitDiscoveryProbeJitter()) {
+                        continue;
+                    }
                     sendDiscovery();
                 }
             }

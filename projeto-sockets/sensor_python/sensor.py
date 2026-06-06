@@ -17,7 +17,7 @@ GATEWAY_DISCOVERY_PORT = 5002
 
 CONTROL_TCP_PORT = 5004
 MULTICAST_GROUP = "239.0.0.1"
-MULTICAST_PORT = 5000
+MULTICAST_PORT = 5005
 
 SECTORS = (
     ("Pici", "pici"),
@@ -32,6 +32,7 @@ MAX_UDP_SEND_ATTEMPTS = 3
 BASE_RETRY_DELAY_SECS = 0.2
 MAX_RETRY_DELAY_SECS = 1.5
 TELEMETRY_JITTER_SECS = 0.35
+DISCOVERY_PROBE_JITTER_SECS = 2.0
 MANUAL_OVERRIDE_SECS = 30.0
 THRESHOLD_SCAN_INTERVAL_SECS = 1.0
 THRESHOLD_EVENT_COOLDOWN_SECS = 3.0
@@ -85,6 +86,10 @@ def retry_delay_secs(attempt: int) -> float:
 
 def telemetry_wait_secs(frequency_secs: int) -> float:
     return max(1.0, float(frequency_secs) + random.uniform(0, TELEMETRY_JITTER_SECS))
+
+
+def discovery_probe_jitter_secs() -> float:
+    return random.uniform(0.0, DISCOVERY_PROBE_JITTER_SECS)
 
 
 def send_udp_message(message, port: int) -> None:
@@ -411,10 +416,13 @@ def multicast_listener_loop() -> None:
                 continue
 
             if data == b"SMARTCITY_DISCOVERY_PROBE":
+                delay = discovery_probe_jitter_secs()
                 print(
                     f"[sensor_camera] | [Sensor Python:Multicast] Probe recebido de {addr[0]}. "
-                    "Reenviando descoberta da frota."
+                    f"Reenviando descoberta da frota em {delay * 1000:.0f} ms."
                 )
+                if shutdown_event.wait(delay):
+                    continue
                 send_discovery_response()
 
 

@@ -18,12 +18,13 @@
 #define GATEWAY_TELEMETRY_PORT "5000"
 #define GATEWAY_DISCOVERY_PORT "5002"
 #define MULTICAST_GROUP        "239.0.0.1"
-#define MULTICAST_PORT         5000
+#define MULTICAST_PORT         5005
 #define SLEEP_INTERVAL_SECS    5
 #define UDP_MAX_RETRIES        3
 #define UDP_RETRY_BASE_USEC    200000
 #define UDP_RETRY_MAX_USEC     1500000
 #define TELEMETRY_JITTER_USEC  500000
+#define DISCOVERY_PROBE_JITTER_USEC 2000000
 #define NUM_METRICS            6
 #define THRESHOLD_SCAN_INTERVAL_SECS 1.0
 #define THRESHOLD_EVENT_COOLDOWN_SECS 3.0
@@ -330,6 +331,24 @@ static void sleep_with_threshold_scans(unsigned int base_secs) {
     }
 }
 
+static useconds_t discovery_probe_jitter_usec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    uint64_t mixed = (uint64_t)ts.tv_nsec
+                   ^ ((uint64_t)ts.tv_sec << 21)
+                   ^ ((uint64_t)getpid() << 11)
+                   ^ (uint64_t)(uintptr_t)pthread_self();
+    return (useconds_t)(mixed % (DISCOVERY_PROBE_JITTER_USEC + 1));
+}
+
+static void wait_discovery_probe_jitter(void) {
+    useconds_t delay = discovery_probe_jitter_usec();
+    printf("[Sensor C:Thread] Jitter de redescoberta: %.0f ms.\n",
+           (double)delay / 1000.0);
+    usleep(delay);
+}
+
 // ====================================================================
 // PROTOCOLO: DESCOBERTA
 // ====================================================================
@@ -438,11 +457,12 @@ void *multicast_listener_thread(void *arg) {
         if (n > 0) {
             buffer[n] = '\0';
             if (strcmp(buffer, "SMARTCITY_DISCOVERY_PROBE") == 0) {
-                printf("[Sensor C:Thread] Probe interceptado — re-sincronizando topologia.\n");
+                printf("[Sensor C:Thread] Probe interceptado — re-sincronizando topologia com jitter.\n");
                 /*
                  * send_discovery_announcement() cria seu próprio socket efêmero
                  * internamente — sem disputa com global_sockfd da thread principal.
                  */
+                wait_discovery_probe_jitter();
                 send_discovery_announcement();
             }
         }
