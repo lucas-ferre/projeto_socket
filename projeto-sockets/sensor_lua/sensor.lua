@@ -83,29 +83,12 @@ end
 local DEFAULT_DEVICE_ID = device_order[1]
 
 -- ====================================================================
--- RESOLUÇÃO DNS — executada UMA ÚNICA VEZ no boot e cacheada
+-- RESOLUÇÃO DNS SOB DEMANDA
 -- ====================================================================
 
-local function get_gateway_ip()
-    for attempt = 1, UDP_MAX_RETRIES do
-        local ip = socket.dns.toip(GATEWAY_HOST)
-        if ip then return ip end
-
-        if attempt < UDP_MAX_RETRIES then
-            local delay = math.min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2 ^ (attempt - 1)))
-                          + (math.random() * RETRY_BASE_DELAY)
-            print(string.format("[Sensor Lua:Retry] DNS do Gateway falhou (tentativa %d/%d). Retry em %.2fs.",
-                  attempt, UDP_MAX_RETRIES, delay))
-            socket.sleep(delay)
-        end
-    end
-    print("[Sensor Lua:Aviso] DNS indisponível após retries. Fallback para 127.0.0.1.")
-    return "127.0.0.1"
-end
-
-local GATEWAY_IP = get_gateway_ip()
-print(string.format("[Sensor Lua:DNS] Gateway '%s' resolvido para %s — IP cacheado.",
-      GATEWAY_HOST, GATEWAY_IP))
+print(string.format(
+    "[sensor_posto] | [Sensor Lua:DNS] Gateway '%s' será resolvido durante cada envio UDP.",
+    GATEWAY_HOST))
 
 -- ====================================================================
 -- INICIALIZAÇÃO DE DESCRITORES DE REDE (SOCKETS POSIX BOUND)
@@ -187,6 +170,10 @@ local function heartbeat_delay()
     return HEARTBEAT_INTERVAL_SECS + (math.random() * HEARTBEAT_JITTER_SECS)
 end
 
+local function udp_error_text(err)
+    return err and tostring(err) or "falha desconhecida"
+end
+
 local function random_device_status()
     local roll = math.random(1, 100)
     if roll <= 78 then return "STATUS_ON"  end
@@ -214,6 +201,9 @@ local function send_udp_nonblocking(bytes, host, port, channel)
     local ok, err = udp_out:sendto(bytes, host, port)
     if ok then return true end
 
+    err = udp_error_text(err)
+    local delay = retry_delay(1)
+
     if queue_size(udp_retry_queue) < UDP_RETRY_QUEUE_MAX then
         enqueue(udp_retry_queue, {
             bytes         = bytes,
@@ -221,15 +211,15 @@ local function send_udp_nonblocking(bytes, host, port, channel)
             port          = port,
             channel       = channel,
             attempts      = 1,
-            next_retry_at = socket.gettime() + retry_delay(1)
+            next_retry_at = socket.gettime() + delay
         })
         print(string.format(
-            "[Sensor Lua:Retry] %s enfileirado (tentativa 1/%d). Err: %s",
-            channel, UDP_MAX_RETRIES, err or "desconhecido"))
+            "[sensor_posto] | [Sensor Lua:Retry] Falha UDP porta %d (tentativa 1/%d): %s. Retry em %.2fs.",
+            port, UDP_MAX_RETRIES, err, delay))
     else
         print(string.format(
-            "[Sensor Lua:Retry] Fila saturada — %s descartado. Err: %s",
-            channel, err or "desconhecido"))
+            "[sensor_posto] | [Sensor Lua:Retry] Falha UDP porta %d (tentativa 1/%d): %s. Fila de retry saturada; pacote %s descartado.",
+            port, UDP_MAX_RETRIES, err, channel))
     end
     return false, err
 end
@@ -244,24 +234,34 @@ local function process_udp_retry_queue(current_time)
 
         dequeue(udp_retry_queue)
         processed = processed + 1
+        local attempt_number = entry.attempts + 1
 
         local ok, err = udp_out:sendto(entry.bytes, entry.host, entry.port)
         if ok then
-            print(string.format("[Sensor Lua:Retry] %s retransmitido com sucesso (tentativa %d).",
-                  entry.channel, entry.attempts))
-        elseif entry.attempts < UDP_MAX_RETRIES then
-            entry.attempts     = entry.attempts + 1
-            entry.next_retry_at = current_time + retry_delay(entry.attempts)
-            if queue_size(udp_retry_queue) < UDP_RETRY_QUEUE_MAX then
-                enqueue(udp_retry_queue, entry)
-            else
-                print(string.format(
-                    "[Sensor Lua:Retry] Fila saturada — %s descartado após %d tentativas.",
-                    entry.channel, entry.attempts))
-            end
+            print(string.format(
+                "[sensor_posto] | [Sensor Lua:Retry] %s retransmitido com sucesso (tentativa %d/%d).",
+                entry.channel, attempt_number, UDP_MAX_RETRIES))
         else
-            print(string.format("[Sensor Lua:Retry] %s descartado após %d tentativas (sem ACK).",
-                  entry.channel, UDP_MAX_RETRIES))
+            err = udp_error_text(err)
+            if attempt_number >= UDP_MAX_RETRIES then
+                print(string.format(
+                    "[sensor_posto] | [Sensor Lua:Retry] Falha UDP porta %d (tentativa %d/%d): %s. Todas as tentativas esgotadas.",
+                    entry.port, attempt_number, UDP_MAX_RETRIES, err))
+            else
+                local delay = retry_delay(attempt_number)
+                entry.attempts      = attempt_number
+                entry.next_retry_at = current_time + delay
+                if queue_size(udp_retry_queue) < UDP_RETRY_QUEUE_MAX then
+                    enqueue(udp_retry_queue, entry)
+                    print(string.format(
+                        "[sensor_posto] | [Sensor Lua:Retry] Falha UDP porta %d (tentativa %d/%d): %s. Retry em %.2fs.",
+                        entry.port, attempt_number, UDP_MAX_RETRIES, err, delay))
+                else
+                    print(string.format(
+                        "[sensor_posto] | [Sensor Lua:Retry] Falha UDP porta %d (tentativa %d/%d): %s. Fila de retry saturada; pacote %s descartado.",
+                        entry.port, attempt_number, UDP_MAX_RETRIES, err, entry.channel))
+                end
+            end
         end
     end
 end
@@ -323,13 +323,15 @@ local function send_discovery_response(target_device_id)
                 is_controllable = true
             }
             local bytes = assert(pb.encode("smartcity.DiscoveryResponse", msg))
-            local ok, err = send_udp_nonblocking(bytes, GATEWAY_IP, GATEWAY_UDP_DISCOVERY_PORT, "Descoberta")
+            local ok, err = send_udp_nonblocking(bytes, GATEWAY_HOST, GATEWAY_UDP_DISCOVERY_PORT, "Descoberta")
             if ok then
                 print(string.format(
                     "[Sensor Lua:Descoberta] Dispositivo=%s | Setor=%s | Status=%s | Porta=%d.",
                     device.device_id, device.sector, device.status, GATEWAY_UDP_DISCOVERY_PORT))
             else
-                print(string.format("[Sensor Lua:Erro] Descoberta enfileirada para retry: %s", err or ""))
+                print(string.format(
+                    "[sensor_posto] | [Sensor Lua:Erro] Falha ao enviar descoberta de %s: %s",
+                    device.device_id, udp_error_text(err)))
             end
         end
     end
@@ -377,7 +379,7 @@ local function send_metrics_payload(device, trigger_reason, metrics_override)
         metrics        = metrics
     }
     local bytes = assert(pb.encode("smartcity.DataPayload", payload))
-    local ok, err = send_udp_nonblocking(bytes, GATEWAY_IP, GATEWAY_TELEMETRY_PORT, "Telemetria")
+    local ok, err = send_udp_nonblocking(bytes, GATEWAY_HOST, GATEWAY_TELEMETRY_PORT, "Telemetria")
 
     if ok and device.status == "STATUS_ON" then
         local label = trigger_reason and "Evento por limiar" or "Telemetria injetada"
@@ -390,7 +392,9 @@ local function send_metrics_payload(device, trigger_reason, metrics_override)
         print(string.format("[Sensor Lua:UDP] Heartbeat | Dispositivo=%s | Status=%s",
               device.device_id, device.status))
     else
-        print(string.format("[Sensor Lua:Erro] Telemetria enfileirada para retry: %s", err or ""))
+        print(string.format(
+            "[sensor_posto] | [Sensor Lua:Erro] Falha ao enviar telemetria de %s: %s",
+            device.device_id, udp_error_text(err)))
     end
 end
 

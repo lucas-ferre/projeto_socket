@@ -38,43 +38,6 @@ public class sensor {
         }
     }
 
-    private static final InetAddress GATEWAY_ADDR;
-    static {
-        
-        InetAddress resolved = null;
-        for (int attempt = 0; attempt < UDP_MAX_RETRIES; attempt++) {
-            try {
-                resolved = InetAddress.getByName(GATEWAY_HOST);
-                System.out.println("[Java:Config] DNS '" + GATEWAY_HOST
-                    + "' resolvido na tentativa " + (attempt + 1) + ".");
-                break;
-            } catch (UnknownHostException e) {
-                long delay = 200L << attempt; // 200 → 400 → 800 ms
-                String suffix = (attempt < UDP_MAX_RETRIES - 1)
-                    ? ". Retry em " + delay + "ms..."
-                    : ". Esgotadas todas as tentativas.";
-                System.err.println("[Java:Config] DNS '" + GATEWAY_HOST
-                    + "' falhou (tentativa " + (attempt + 1) + "/" + UDP_MAX_RETRIES
-                    + "): " + e.getMessage() + suffix);
-                if (attempt < UDP_MAX_RETRIES - 1) {
-                    try {
-                        Thread.sleep(delay);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
-            }
-        }
-        if (resolved == null) {
-            throw new ExceptionInInitializerError(
-                "Falha ao resolver gateway DNS '" + GATEWAY_HOST
-                    + "' após " + UDP_MAX_RETRIES + " tentativas."
-            );
-        }
-        GATEWAY_ADDR = resolved;
-    }
-
     // Portas segregadas para multiplexação espacial UDP
     private static final int GATEWAY_TELEMETRY_PORT = 5000;
     private static final int GATEWAY_DISCOVERY_PORT = 5002;
@@ -113,6 +76,24 @@ public class sensor {
         DeviceState(String deviceId, String sector) {
             this.deviceId = deviceId;
             this.sector = sector;
+        }
+    }
+
+    private static class UdpSendResult {
+        final boolean success;
+        final String errorMessage;
+
+        private UdpSendResult(boolean success, String errorMessage) {
+            this.success = success;
+            this.errorMessage = errorMessage;
+        }
+
+        static UdpSendResult ok() {
+            return new UdpSendResult(true, "");
+        }
+
+        static UdpSendResult failed(String errorMessage) {
+            return new UdpSendResult(false, errorMessage);
         }
     }
 
@@ -210,18 +191,20 @@ public class sensor {
         return null;
     }
 
-    private static boolean waitBeforeRetry(String channel, int attempt, Exception e) {
-        long delay = retryDelayMillis(attempt);
-        System.err.println("[Java:Retry] UDP " + channel + " falhou (tentativa "
-            + (attempt + 1) + "/" + UDP_MAX_RETRIES + "): " + e.getMessage()
-            + ". Retry em " + delay + "ms.");
-        try {
-            Thread.sleep(delay);
-            return true;
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            return false;
+    private static String cleanNetworkError(Exception e) {
+        String message = e.getMessage();
+        if (message == null || message.isBlank()) {
+            return e.getClass().getSimpleName();
         }
+        String gatewayPrefix = GATEWAY_HOST + ": ";
+        if (message.startsWith(gatewayPrefix)) {
+            return message.substring(gatewayPrefix.length());
+        }
+        return message;
+    }
+
+    private static String formatDelaySeconds(long delayMillis) {
+        return String.format(java.util.Locale.ROOT, "%.2fs", delayMillis / 1000.0);
     }
 
     private static boolean waitDiscoveryProbeJitter() {
@@ -236,20 +219,39 @@ public class sensor {
         }
     }
 
-    private static boolean sendUdpWithRetry(DatagramSocket socket, byte[] buf, int port, String channel) {
+    private static UdpSendResult sendUdpWithRetry(DatagramSocket socket, byte[] buf, int port) {
+        String lastError = "falha desconhecida";
+
         for (int attempt = 0; attempt < UDP_MAX_RETRIES; attempt++) {
             try {
-                socket.send(new DatagramPacket(buf, buf.length, GATEWAY_ADDR, port));
-                return true;
+                InetAddress gatewayAddr = InetAddress.getByName(GATEWAY_HOST);
+                socket.send(new DatagramPacket(buf, buf.length, gatewayAddr, port));
+                return UdpSendResult.ok();
             } catch (Exception e) {
-                if (!waitBeforeRetry(channel, attempt, e)) {
-                    System.err.println("[Java:Erro] UDP " + channel + " descartado após retries: " + e.getMessage());
-                    return false;
+                lastError = cleanNetworkError(e);
+
+                if (attempt == UDP_MAX_RETRIES - 1) {
+                    System.err.println("[sensor_semaforo] | [Sensor Java:Retry] Falha UDP porta "
+                        + port + " (tentativa " + (attempt + 1) + "/" + UDP_MAX_RETRIES
+                        + "): " + lastError + ". Todas as tentativas esgotadas.");
+                    break;
+                }
+
+                long delay = retryDelayMillis(attempt);
+                System.err.println("[sensor_semaforo] | [Sensor Java:Retry] Falha UDP porta "
+                    + port + " (tentativa " + (attempt + 1) + "/" + UDP_MAX_RETRIES
+                    + "): " + lastError + ". Retry em " + formatDelaySeconds(delay) + ".");
+
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return UdpSendResult.failed(lastError);
                 }
             }
         }
-        System.err.println("[Java:Erro] UDP " + channel + " descartado após retries");
-        return false;
+
+        return UdpSendResult.failed(lastError);
     }
 
     /** Empacota e despacha o descritor de topologia para a porta 5002 */
@@ -279,14 +281,19 @@ public class sensor {
             byte[] buf = disc.toByteArray();
 
             // Roteamento exclusivo para o pipeline de Descoberta
-            if (sendUdpWithRetry(DISC_SOCKET, buf, GATEWAY_DISCOVERY_PORT, "Descoberta")) {
+            UdpSendResult sendResult = sendUdpWithRetry(DISC_SOCKET, buf, GATEWAY_DISCOVERY_PORT);
+            if (sendResult.success) {
                 System.out.println("[Java:Descoberta] Dispositivo=" + device.deviceId
                     + " | Setor=" + device.sector
                     + " | Status=" + Messages.DeviceStatus.forNumber(device.currentStatus)
                     + " | Handshake de topologia emitido com sucesso.");
+            } else {
+                System.err.println("[sensor_semaforo] | [Sensor Java:Erro] Falha ao enviar descoberta de "
+                    + device.deviceId + ": " + sendResult.errorMessage);
             }
         } catch (Exception e) {
-            System.err.println("[Java:Erro] Falha ao despachar pacote de descoberta: " + e.getMessage());
+            System.err.println("[sensor_semaforo] | [Sensor Java:Erro] Falha ao preparar descoberta de "
+                + device.deviceId + ": " + cleanNetworkError(e));
         }
     }
 
@@ -479,7 +486,8 @@ public class sensor {
         byte[] b = p.toByteArray();
 
         // Roteamento estrito para o pipeline de Telemetria contínua
-        if (sendUdpWithRetry(socket, b, GATEWAY_TELEMETRY_PORT, "Telemetria")) {
+        UdpSendResult sendResult = sendUdpWithRetry(socket, b, GATEWAY_TELEMETRY_PORT);
+        if (sendResult.success) {
             String eventLabel = triggerReason == null ? "Telemetria injetada" : "Evento por limiar";
             System.out.println("[Java:UDP] " + eventLabel
                 + " | Dispositivo=" + device.deviceId
@@ -488,6 +496,9 @@ public class sensor {
                 + " | Status=" + Messages.DeviceStatus.forNumber(device.currentStatus)
                 + (queueLength == null ? "" : " | Fila=" + queueLength + " veiculos")
                 + (triggerReason == null ? "" : " | Limiar=" + triggerReason));
+        } else {
+            System.err.println("[sensor_semaforo] | [Sensor Java:Erro] Falha ao enviar telemetria de "
+                + device.deviceId + ": " + sendResult.errorMessage);
         }
     }
 
