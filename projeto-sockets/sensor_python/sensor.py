@@ -1,4 +1,5 @@
 import os
+import queue
 import random
 import signal
 import socket
@@ -62,6 +63,13 @@ TRAFFIC_INFRACTIONS_THRESHOLD = int(os.getenv("TRAFFIC_INFRACTIONS_THRESHOLD", "
 
 shutdown_event = threading.Event()
 state_lock = threading.Lock()
+
+# Fila de probes de descoberta recebidos via multicast.
+# O multicast_listener_loop enfileira o instante monotônico em que a resposta
+# deve ser enviada (agora + jitter). O probe_dispatch_loop consome a fila em
+# thread separada, sem bloquear o listener.
+# maxsize=20 evita crescimento ilimitado se o gateway disparar probes em rajada.
+_probe_dispatch_queue: queue.Queue[float] = queue.Queue(maxsize=20)
 
 
 def build_device_fleet(count: int) -> dict[str, dict]:
@@ -441,14 +449,69 @@ def multicast_listener_loop() -> None:
                 continue
 
             if data == b"SMARTCITY_DISCOVERY_PROBE":
-                delay = discovery_probe_jitter_secs()
-                print(
-                    f"[sensor_camera] | [Sensor Python:Multicast] Probe recebido de {addr[0]}. "
-                    f"Reenviando descoberta da frota em {delay * 1000:.0f} ms."
-                )
-                if shutdown_event.wait(delay):
-                    continue
-                send_discovery_response()
+                jitter = discovery_probe_jitter_secs()
+                send_at = time.monotonic() + jitter
+                try:
+                    # put_nowait garante que o listener nunca bloqueia.
+                    # Se a fila estiver cheia (rajada de probes), o probe é
+                    # descartado — o dispatch já tem respostas suficientes pendentes.
+                    _probe_dispatch_queue.put_nowait(send_at)
+                    print(
+                        f"[sensor_camera] | [Sensor Python:Multicast] Probe de {addr[0]} "
+                        f"enfileirado — resposta agendada em {jitter * 1000:.0f} ms "
+                        f"({_probe_dispatch_queue.qsize()} na fila)."
+                    )
+                except queue.Full:
+                    print(
+                        f"[sensor_camera] | [Sensor Python:Multicast] Fila cheia "
+                        f"({_probe_dispatch_queue.maxsize} itens) — probe de {addr[0]} descartado."
+                    )
+
+
+def probe_dispatch_loop() -> None:
+    """Consome a fila de probes e envia DiscoveryResponse com jitter.
+
+    Comportamentos-chave:
+    - Aguarda até o instante agendado usando shutdown_event.wait(), permitindo
+      encerramento limpo sem precisar esgotar o timeout.
+    - Após o wait, drena todos os itens adicionais da fila (coalescência): se N
+      probes chegaram enquanto o sensor aguardava, apenas UMA resposta é enviada,
+      evitando burst de pacotes de descoberta desnecessários.
+    - Nunca bloqueia o multicast_listener_loop — as threads são totalmente
+      independentes e comunicam apenas via _probe_dispatch_queue.
+    """
+    while not shutdown_event.is_set():
+        # Bloqueia até que um probe seja enfileirado (timeout para checar shutdown)
+        try:
+            send_at = _probe_dispatch_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        # Aguarda o instante agendado (jitter), saindo imediatamente no shutdown
+        remaining = send_at - time.monotonic()
+        if remaining > 0 and shutdown_event.wait(remaining):
+            break
+
+        if shutdown_event.is_set():
+            break
+
+        # Coalescência: drena probes adicionais que chegaram durante a espera.
+        # Cada item drenado representa um probe que não precisará de resposta própria.
+        coalesced = 0
+        while True:
+            try:
+                _probe_dispatch_queue.get_nowait()
+                coalesced += 1
+            except queue.Empty:
+                break
+
+        if coalesced:
+            print(
+                f"[sensor_camera] | [Sensor Python:Dispatch] {coalesced} probe(s) adicional(is) "
+                f"coalescido(s) — enviando resposta única para a frota."
+            )
+
+        send_discovery_response()
 
 
 def heartbeat_loop() -> None:
@@ -499,6 +562,7 @@ def main() -> None:
 
     threading.Thread(target=control_server_loop, daemon=True).start()
     threading.Thread(target=multicast_listener_loop, daemon=True).start()
+    threading.Thread(target=probe_dispatch_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
 
     send_discovery_response()

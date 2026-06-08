@@ -14,8 +14,8 @@ public class sensor {
         {"Porangabussu", "porangabussu"}
     };
     private static final int DEVICE_COUNT = Math.max(1, Integer.parseInt(System.getenv().getOrDefault("JAVA_DEVICE_COUNT", String.valueOf(SECTORS.length))));
-    private static final java.util.Map<String, DeviceState> DEVICES = new java.util.LinkedHashMap<>();
-    private static final java.util.List<String> DEVICE_ORDER = new java.util.ArrayList<>();
+    private static final java.util.Map<String, DeviceState> DEVICES = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.List<String> DEVICE_ORDER = new java.util.concurrent.CopyOnWriteArrayList<>();
     private static final String DEFAULT_DEVICE_ID;
     private static final String GATEWAY_HOST = "gateway";
     private static final String DEVICE_HOSTNAME;
@@ -24,6 +24,8 @@ public class sensor {
         try { h = InetAddress.getLocalHost().getHostName(); } catch (Exception ignored) {}
         DEVICE_HOSTNAME = h;
     }
+
+    private static final int UDP_MAX_RETRIES = 3;
 
     private static final DatagramSocket DISC_SOCKET;
     static {
@@ -38,23 +40,48 @@ public class sensor {
 
     private static final InetAddress GATEWAY_ADDR;
     static {
-        try {
-            GATEWAY_ADDR = InetAddress.getByName(GATEWAY_HOST);
-        } catch (UnknownHostException e) {
+        
+        InetAddress resolved = null;
+        for (int attempt = 0; attempt < UDP_MAX_RETRIES; attempt++) {
+            try {
+                resolved = InetAddress.getByName(GATEWAY_HOST);
+                System.out.println("[Java:Config] DNS '" + GATEWAY_HOST
+                    + "' resolvido na tentativa " + (attempt + 1) + ".");
+                break;
+            } catch (UnknownHostException e) {
+                long delay = 200L << attempt; // 200 → 400 → 800 ms
+                String suffix = (attempt < UDP_MAX_RETRIES - 1)
+                    ? ". Retry em " + delay + "ms..."
+                    : ". Esgotadas todas as tentativas.";
+                System.err.println("[Java:Config] DNS '" + GATEWAY_HOST
+                    + "' falhou (tentativa " + (attempt + 1) + "/" + UDP_MAX_RETRIES
+                    + "): " + e.getMessage() + suffix);
+                if (attempt < UDP_MAX_RETRIES - 1) {
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+        if (resolved == null) {
             throw new ExceptionInInitializerError(
-                "Falha ao resolver gateway DNS '" + GATEWAY_HOST + "': " + e.getMessage()
+                "Falha ao resolver gateway DNS '" + GATEWAY_HOST
+                    + "' após " + UDP_MAX_RETRIES + " tentativas."
             );
         }
+        GATEWAY_ADDR = resolved;
     }
 
     // Portas segregadas para multiplexação espacial UDP
     private static final int GATEWAY_TELEMETRY_PORT = 5000;
     private static final int GATEWAY_DISCOVERY_PORT = 5002;
-    
+
     private static final int CONTROL_TCP_PORT = 5003;
     private static final String MULTICAST_GROUP = "239.0.0.1";
     private static final int MULTICAST_PORT = 5005;
-    private static final int UDP_MAX_RETRIES = 3;
     private static final long RETRY_BASE_DELAY_MS = 200L;
     private static final long RETRY_MAX_DELAY_MS = 1500L;
     private static final long TELEMETRY_JITTER_MS = 350L;
@@ -239,6 +266,8 @@ public class sensor {
         // [M4] Reutiliza DISC_SOCKET estático — sem criação/destruição de socket por chamada
         try {
             Messages.DiscoveryResponse disc = Messages.DiscoveryResponse.newBuilder()
+                .setMessageId("DISC-" + device.deviceId + "-" + System.currentTimeMillis())
+                .setTimestamp(Instant.now().getEpochSecond())
                 .setDeviceId(device.deviceId)
                 .setType(Messages.DeviceType.DEVICE_TYPE_TRAFFIC_LIGHT)
                 .setIpAddress(DEVICE_HOSTNAME)
@@ -279,12 +308,12 @@ public class sensor {
     private static void startTcpServer() {
         try (ServerSocket server = new ServerSocket(CONTROL_TCP_PORT)) {
             System.out.println("[Java:TCP] Interface de atuação aguardando conexões na porta " + CONTROL_TCP_PORT);
-            
+
             while (true) {
                 try (Socket s = server.accept();
                      DataInputStream in = new DataInputStream(s.getInputStream());
                      DataOutputStream out = new DataOutputStream(s.getOutputStream())) {
-                    
+
                     // Framing: Extração estrita do prefixo de 4 bytes (Big-Endian nativo do Java)
                     int len = in.readInt();
                     if (len <= 0 || len > MAX_TCP_FRAME_BYTES) {
@@ -315,14 +344,20 @@ public class sensor {
                         continue;
                     }
 
+                    synchronized (target) {
+                        if (cmd.getUpdateStatus()) {
+                            target.currentStatus = cmd.getTargetStatus().getNumber();
+                            target.manualUntilMillis = System.currentTimeMillis() + MANUAL_OVERRIDE_MS;
+                        }
+                    }
+                    // Log fora do bloco synchronized — I/O com lock adquirido é má prática.
                     if (cmd.getUpdateStatus()) {
-                        target.currentStatus = cmd.getTargetStatus().getNumber();
-                        target.manualUntilMillis = System.currentTimeMillis() + MANUAL_OVERRIDE_MS;
                         System.out.println("[Java:Atuação] Dispositivo=" + target.deviceId
                             + " | Setor=" + target.sector
                             + " | Transição de estado para: " + target.currentStatus);
                     }
                     if (cmd.getUpdateFrequency()) {
+                        // frequencySecs é volatile — write simples, não precisa de synchronized
                         target.frequencySecs = cmd.getNewFrequencySecs();
                         System.out.println("[Java:Atuação] Dispositivo=" + target.deviceId
                             + " | Setor=" + target.sector
@@ -340,17 +375,30 @@ public class sensor {
                         .build();
 
                     byte[] respBuf = resp.toByteArray();
-                    
+
                     // Aplicação do Framing na resposta: [Prefixo Int32] + [Vetor Binário]
                     out.writeInt(respBuf.length);
                     out.write(respBuf);
                     sendDiscovery(target.deviceId);
-                } catch (Exception e) { 
-                    System.err.println("[Java:Erro] Falha no pipeline TCP: " + e.getMessage()); 
+                } catch (Exception e) {
+                    // [Fix 2] SocketException("interrupted") é a forma como operações de socket
+                    // sinalizam interrupção do thread — não é identificável como InterruptedException.
+                    // Verificar o flag antes de logar e continuar o loop de conexões.
+                    if (Thread.currentThread().isInterrupted()) {
+                        Thread.currentThread().interrupt();
+                        System.out.println("[Java:TCP] Thread interrompida — encerrando servidor TCP.");
+                        return;
+                    }
+                    System.err.println("[Java:Erro] Falha no pipeline TCP: " + e.getMessage());
                 }
             }
-        } catch (Exception e) { 
-            e.printStackTrace(); 
+        } catch (Exception e) {
+            // [Fix 2] Interrupção durante ServerSocket.accept() ou na criação do servidor.
+            if (Thread.currentThread().isInterrupted()) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            e.printStackTrace();
         }
     }
 
@@ -374,12 +422,12 @@ public class sensor {
             System.out.println("[Java:Multicast] Inscrito no grupo de resiliência "
                 + MULTICAST_GROUP + ":" + MULTICAST_PORT
                 + (ni != null ? " via interface " + ni.getName() : " (interface padrão do sistema)"));
-            
+
             byte[] buf = new byte[256];
             while (true) {
                 DatagramPacket p = new DatagramPacket(buf, buf.length);
                 mc.receive(p);
-                
+
                 String probeData = new String(p.getData(), 0, p.getLength());
                 if (probeData.equals("SMARTCITY_DISCOVERY_PROBE")) {
                     System.out.println("[Java:Multicast] Probe de recuperação detectado. Re-sincronizando topologia com jitter!");
@@ -389,8 +437,14 @@ public class sensor {
                     sendDiscovery();
                 }
             }
-        } catch (Exception e) { 
-            e.printStackTrace(); 
+        } catch (Exception e) {
+            // [Fix 2] mc.receive() lança SocketException (não InterruptedException) quando o
+            // thread é interrompido. Restaurar o flag e sair limpo em vez de printar stacktrace.
+            if (Thread.currentThread().isInterrupted()) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            e.printStackTrace();
         }
     }
 
@@ -474,8 +528,14 @@ public class sensor {
                         continue;
                     }
 
-                    if (nowMillis >= device.manualUntilMillis) {
-                        device.currentStatus = randomDeviceStatus();
+                    // Seção crítica: check(manualUntilMillis) e act(currentStatus) devem
+                    // ser atômicos. Sem synchronized, o TCP thread pode aplicar um
+                    // STATUS_OFF + manualUntilMillis=futuro entre o check e o write aqui,
+                    // e o loop sobrescreve o comando com um status aleatório.
+                    synchronized (device) {
+                        if (nowMillis >= device.manualUntilMillis) {
+                            device.currentStatus = randomDeviceStatus();
+                        }
                     }
                     device.nextSendAtMillis = nowMillis + telemetryDelayMillis(device.frequencySecs);
 
@@ -489,12 +549,24 @@ public class sensor {
 
                     sendTelemetryPayload(socket, device, null, queueLength);
                 }
-                
+
                 // Suspensão curta: cada dispositivo gerencia sua própria janela de amostragem.
                 Thread.sleep(200L);
             }
-        } catch (Exception e) { 
-            e.printStackTrace(); 
+        } catch (InterruptedException ie) {
+            // [Fix 2] Thread.sleep(200L) lança InterruptedException quando o thread é
+            // interrompido. Capturar separadamente de Exception para restaurar o flag
+            // e encerrar o loop limpo, sem printar stacktrace.
+            Thread.currentThread().interrupt();
+            System.out.println("[Java:UDP] Thread de telemetria interrompida — encerrando loop.");
+        } catch (Exception e) {
+            // [Fix 2] Verificar interrupção também aqui: operações de socket podem lançar
+            // SocketException("interrupted") em vez de InterruptedException.
+            if (Thread.currentThread().isInterrupted()) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            e.printStackTrace();
         }
     }
 }

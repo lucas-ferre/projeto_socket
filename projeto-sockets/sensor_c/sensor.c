@@ -57,14 +57,62 @@ char        global_device_ids     [DEVICE_COUNT_MAX][64];
 const char *global_device_sectors [DEVICE_COUNT_MAX];
 Smartcity__DeviceStatus global_device_statuses[DEVICE_COUNT_MAX];
 pthread_mutex_t statuses_mutex = PTHREAD_MUTEX_INITIALIZER;
-double      global_last_threshold_send[DEVICE_COUNT_MAX];
-unsigned int global_seq_counter = 0;
+
+/*
+ * [Fix 1] global_last_threshold_send — acessado EXCLUSIVAMENTE pelo main thread:
+ *   · poll_threshold_events()  → chamada via sleep_with_threshold_scans()
+ *   · loop de telemetria       → imediatamente após a escrita de status
+ * A thread multicast só chama send_discovery_announcement(), que não toca este
+ * array. Mutex seria correto se outras threads escrevessem aqui; como não escrevem,
+ * o acesso é thread-safe por design de chamada. O comentário torna esse contrato
+ * explícito para futuros mantenedores.
+ */
+double global_last_threshold_send[DEVICE_COUNT_MAX];  /* single-threaded: main apenas */
+
+/*
+ * [Fix 2] global_seq_counter como atomic_uint.
+ *
+ * Problema original: declarado como plain 'unsigned int', mas <stdatomic.h> estava
+ * importado sem uso — sinalizando intenção atômica não implementada. A operação
+ * seq_counter++ é um read-modify-write não atômico: em plataformas onde o compilador
+ * gera load + add + store separados, uma segunda thread que fizesse o mesmo poderia
+ * produzir duplicatas de sequence ID.
+ *
+ * Embora send_environment_payload() seja chamado apenas do main thread hoje,
+ * usar atomic_uint:
+ *   · elimina o UB caso o padrão de chamadas mude;
+ *   · honra o contrato implícito do #include <stdatomic.h>;
+ *   · é custo zero em x86/ARM (uma instrução lock xadd).
+ *
+ * memory_order_relaxed é suficiente: o counter só precisa ser único e crescente —
+ * não é uma barreira de memória para outros dados.
+ */
+atomic_uint global_seq_counter;   /* inicializado em main() via atomic_init() */
 
 static const char *SENSOR_SECTORS[]      = { "Pici", "Benfica", "Porangabussu" };
 static const char *SENSOR_SECTOR_SLUGS[] = { "pici", "benfica", "porangabussu" };
 static const int   SENSOR_SECTOR_COUNT   = 3;
 static const char *METRIC_NAMES[] = { "temperature", "humidity", "co2",   "pm25",   "pm10",   "aqi"   };
 static const char *METRIC_UNITS[] = {          "C",       "%",   "ppm", "ug/m3", "ug/m3", "index" };
+
+/*
+ * [Fix 3] g_self_hostname como variável global, inicializada em main() antes de
+ * pthread_create().
+ *
+ * Problema original: self_hostname era uma variável static local dentro de
+ * send_discovery_announcement(). A inicialização lazy (if hostname[0] == '\0')
+ * funcionava corretamente porque a primeira chamada ocorre em main() ANTES de
+ * pthread_create() — mas dependia silenciosamente dessa ordem de execução.
+ * Se alguém mover ou reordenar as chamadas, a thread multicast e o main thread
+ * poderiam tentar inicializar simultaneamente via gethostname(), que é uma
+ * race condition em memória compartilhada (UB em C11).
+ *
+ * Solução: inicializar explicitamente em main() antes de criar qualquer thread.
+ * O hostname é lido (nunca mais escrito) pelas demais funções — acesso thread-safe
+ * por ser read-only após a inicialização, com a barreira de memória do pthread_create()
+ * garantindo visibilidade para a thread filha.
+ */
+char g_self_hostname[256];   /* inicializado em main() antes de pthread_create() */
 
 // ====================================================================
 // TRATAMENTO DE SINAIS
@@ -260,13 +308,22 @@ static int send_environment_payload(int device_idx,
     char msg_id_buffer[80];
     time_t now = time(NULL);
 
+    /*
+     * [Fix 2] atomic_fetch_add_explicit com memory_order_relaxed:
+     *   · retorna o valor ANTES do incremento (equivalente a seq_counter++)
+     *   · a operação é indivisível — sem load + add + store separados
+     *   · relaxed é suficiente: o counter só precisa de unicidade global,
+     *     não de ordenação de memória em relação a outros dados
+     */
+    unsigned int seq = atomic_fetch_add_explicit(&global_seq_counter, 1,
+                                                 memory_order_relaxed);
     snprintf(msg_id_buffer, sizeof(msg_id_buffer),
-             "%s-%ld-%u", global_device_ids[device_idx], now, global_seq_counter++);
+             "%s-%ld-%u", global_device_ids[device_idx], now, seq);
 
     payload.message_id     = msg_id_buffer;
     payload.timestamp      = now;
     payload.device_id      = global_device_ids[device_idx];
-    
+
     pthread_mutex_lock(&statuses_mutex);
     payload.current_status = global_device_statuses[device_idx];
     pthread_mutex_unlock(&statuses_mutex);
@@ -295,7 +352,7 @@ static int send_environment_payload(int device_idx,
 
     if (sent_ok && payload.current_status == SMARTCITY__DEVICE_STATUS__STATUS_ON) {
         printf("[Sensor C:UDP] %s | Dispositivo=%s | Setor=%s | Status=%s | ID=%s | "
-               "Temp=%.1f°C  UR=%.0f%%  CO₂=%.0fppm  "
+               "Temp=%.1f°C  UR=%.0f%%  CO\xE2\x82\x82=%.0fppm  "
                "PM2.5=%.1f  PM10=%.1f  AQI=%.0f%s\n",
                trigger_reason ? "Evento por limiar" : "Telemetria injetada",
                global_device_ids[device_idx], global_device_sectors[device_idx],
@@ -322,11 +379,13 @@ static int send_environment_payload(int device_idx,
 static void poll_threshold_events(void) {
     double now_mono = monotonic_seconds();
 
+    /* global_last_threshold_send: acesso sem mutex — single-threaded (main apenas).
+     * Ver comentário na declaração da variável. */
     for (int device_idx = 0; device_idx < device_count; device_idx++) {
         pthread_mutex_lock(&statuses_mutex);
         int is_on = (global_device_statuses[device_idx] == SMARTCITY__DEVICE_STATUS__STATUS_ON);
         pthread_mutex_unlock(&statuses_mutex);
-        
+
         if (!is_on)
             continue;
 
@@ -394,32 +453,42 @@ static void wait_discovery_probe_jitter(void) {
 void send_discovery_announcement(void) {
     if (global_gateway_discovery_res == NULL) return;
 
-    /* Socket efêmero exclusivo desta chamada */
+    /* Socket efêmero exclusivo desta chamada — não toca global_sockfd */
     int disc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (disc_sock < 0) {
         perror("[Sensor C:Descoberta] Falha ao criar socket efêmero de descoberta");
         return;
     }
 
-    static char self_hostname[256] = "";
-    if (self_hostname[0] == '\0') {
-        if (gethostname(self_hostname, sizeof(self_hostname)) != 0) {
-            strncpy(self_hostname, "sensor_clima", sizeof(self_hostname) - 1);
-            self_hostname[sizeof(self_hostname) - 1] = '\0';
-        }
-    }
-
+    /*
+     * [Fix 3] g_self_hostname é uma variável global inicializada em main() ANTES
+     * de pthread_create(). Leitura read-only daqui em diante — thread-safe por
+     * definição (sem writer concorrente após a inicialização).
+     *
+     * Problema resolvido: a versão anterior usava 'static char self_hostname[256]'
+     * dentro desta função com inicialização lazy (if hostname[0] == '\0'). Isso
+     * funcionava somente porque a primeira chamada ocorria antes de pthread_create().
+     * Qualquer refatoração que invertesse essa ordem criaria uma race condition entre
+     * main e multicast_listener_thread na escrita concorrente do buffer estático.
+     */
     for (int i = 0; i < device_count; i++) {
+        char disc_msg_id[80];
+        time_t disc_now = time(NULL);
+        snprintf(disc_msg_id, sizeof(disc_msg_id),
+                 "DISC-%s-%ld", global_device_ids[i], (long)disc_now);
+
         Smartcity__DiscoveryResponse disc = SMARTCITY__DISCOVERY_RESPONSE__INIT;
+        disc.message_id      = disc_msg_id;
+        disc.timestamp       = (int64_t)disc_now;
         disc.device_id       = global_device_ids[i];
         disc.type            = SMARTCITY__DEVICE_TYPE__DEVICE_TYPE_WEATHER_STATION;
-        disc.ip_address      = self_hostname;
-        
+        disc.ip_address      = g_self_hostname;    /* [Fix 3] global, não static local */
+
         pthread_mutex_lock(&statuses_mutex);
         disc.initial_status  = global_device_statuses[i];
         Smartcity__DeviceStatus status = global_device_statuses[i];
         pthread_mutex_unlock(&statuses_mutex);
-        
+
         disc.is_controllable = 0;
         disc.control_port    = 0;
 
@@ -433,7 +502,6 @@ void send_discovery_announcement(void) {
 
         smartcity__discovery_response__pack(&disc, buffer);
 
-        /* Usa o socket efêmero — não toca em global_sockfd */
         if (send_udp_with_retry(disc_sock, buffer, packed_size,
                                 global_gateway_discovery_res, "Descoberta") == 0) {
             printf("[Sensor C:Descoberta] Dispositivo=%s | Setor=%s | Status=%s"
@@ -447,7 +515,7 @@ void send_discovery_announcement(void) {
         free(buffer);
     }
 
-    close(disc_sock); /* Encerra o socket efêmero — sem vazamento de fd */
+    close(disc_sock);
 }
 
 // ====================================================================
@@ -473,6 +541,9 @@ void *multicast_listener_thread(void *arg) {
     int reuse = 1;
     setsockopt(mc_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
+    struct timeval mc_timeout = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(mc_sock, SOL_SOCKET, SO_RCVTIMEO, &mc_timeout, sizeof(mc_timeout));
+
     memset(&mc_addr, 0, sizeof(mc_addr));
     mc_addr.sin_family      = AF_INET;
     mc_addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -494,17 +565,20 @@ void *multicast_listener_thread(void *arg) {
     struct sockaddr_in sender_addr;
     socklen_t sender_len = sizeof(sender_addr);
 
-    while (1) {
+    while (keep_running) {
         ssize_t n = recvfrom(mc_sock, buffer, sizeof(buffer) - 1, 0,
                              (struct sockaddr *)&sender_addr, &sender_len);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            if (keep_running)
+                perror("[Sensor C:Thread] Erro no recvfrom Multicast");
+            break;
+        }
         if (n > 0) {
             buffer[n] = '\0';
             if (strcmp(buffer, "SMARTCITY_DISCOVERY_PROBE") == 0) {
                 printf("[Sensor C:Thread] Probe interceptado — re-sincronizando topologia com jitter.\n");
-                /*
-                 * send_discovery_announcement() cria seu próprio socket efêmero
-                 * internamente — sem disputa com global_sockfd da thread principal.
-                 */
                 wait_discovery_probe_jitter();
                 send_discovery_announcement();
             }
@@ -521,6 +595,25 @@ void *multicast_listener_thread(void *arg) {
 
 int main(void) {
     srand((unsigned int)(time(NULL) ^ getpid()));
+
+    /*
+     * [Fix 2] Inicialização explícita do contador atômico de sequência.
+     * atomic_init() é necessário antes de qualquer atomic_fetch_add_explicit().
+     */
+    atomic_init(&global_seq_counter, 0);
+
+    /*
+     * [Fix 3] Inicialização do hostname ANTES de qualquer pthread_create().
+     * g_self_hostname é read-only a partir daqui — todos os acessos posteriores
+     * (inclusive da thread multicast) são thread-safe por definição.
+     */
+    if (gethostname(g_self_hostname, sizeof(g_self_hostname)) != 0) {
+        strncpy(g_self_hostname, "sensor_clima", sizeof(g_self_hostname) - 1);
+        g_self_hostname[sizeof(g_self_hostname) - 1] = '\0';
+        fprintf(stderr, "[Sensor C:Config] gethostname() falhou — usando fallback '%s'.\n",
+                g_self_hostname);
+    }
+    printf("[Sensor C:Config] Hostname resolvido: '%s'.\n", g_self_hostname);
 
     heartbeat_interval_secs = read_env_double("SENSOR_HEARTBEAT_INTERVAL_SECS",
                                               HEARTBEAT_INTERVAL_SECS, 1.0);
@@ -544,7 +637,6 @@ int main(void) {
         }
     }
 
-    /* Inicializa a frota com base em device_count */
     printf("============================================================\n");
     printf("[Sensor C] Inicializando frota de %d Estação(ões) Ambiental(is)...\n",
            device_count);
@@ -558,10 +650,9 @@ int main(void) {
         printf("           [%d] Dispositivo=%-24s | Setor=%s\n",
                i + 1, global_device_ids[i], global_device_sectors[i]);
     }
-    printf("           Métricas: temperatura, umidade, CO\u2082, PM2.5, PM10, AQI\n");
+    printf("           Métricas: temperatura, umidade, CO\xE2\x82\x82, PM2.5, PM10, AQI\n");
     printf("============================================================\n");
 
-    /* 1. Sinais POSIX */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_shutdown_signal;
@@ -570,7 +661,6 @@ int main(void) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
 
-    /* 2. Resolução DNS bifurcada com retry */
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;
@@ -590,7 +680,6 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
-    /* Socket de telemetria — exclusivo da thread principal */
     global_sockfd = socket(global_gateway_telemetry_res->ai_family,
                            global_gateway_telemetry_res->ai_socktype,
                            global_gateway_telemetry_res->ai_protocol);
@@ -601,16 +690,15 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
-    /* 3. Handshake topológico inicial */
+    /* Handshake topológico inicial — g_self_hostname já está inicializado */
     send_discovery_announcement();
 
-    /* 4. Thread de escuta Multicast */
+    /* Thread de escuta Multicast — g_self_hostname é read-only a partir daqui */
     if (pthread_create(&listener_tid, NULL, multicast_listener_thread, NULL) != 0)
         perror("[Sensor C:Aviso] Falha ao criar thread Multicast");
 
     double next_heartbeat_at = monotonic_seconds() + heartbeat_delay_secs();
 
-    /* 5. Loop principal de telemetria — usa exclusivamente global_sockfd */
     while (keep_running) {
         double now_mono = monotonic_seconds();
         if (now_mono >= next_heartbeat_at) {
@@ -632,12 +720,17 @@ int main(void) {
             init_metric_descriptors(metrics, metrics_list);
             populate_environment_metrics(metrics);
 
-            if (current_status == SMARTCITY__DEVICE_STATUS__STATUS_ON
-                && environment_threshold_reason(metrics, reason, sizeof(reason)) != NULL) {
-                global_last_threshold_send[device_idx] = monotonic_seconds();
+            const char *threshold_reason = NULL;
+            if (current_status == SMARTCITY__DEVICE_STATUS__STATUS_ON) {
+                threshold_reason = environment_threshold_reason(
+                    metrics, reason, sizeof(reason));
+                if (threshold_reason != NULL) {
+                    /* global_last_threshold_send: single-threaded — sem mutex */
+                    global_last_threshold_send[device_idx] = monotonic_seconds();
+                }
             }
 
-            send_environment_payload(device_idx, NULL, metrics, metrics_list);
+            send_environment_payload(device_idx, threshold_reason, metrics, metrics_list);
         }
 
         sleep_with_threshold_scans(SLEEP_INTERVAL_SECS);

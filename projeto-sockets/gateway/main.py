@@ -81,6 +81,11 @@ TELEMETRY_QUEUE: asyncio.Queue | None = None
 # Usa OrderedDict com evicção LRU (máx 1000 entradas) para evitar memory leak
 LAST_MESSAGE_INFO = collections.OrderedDict()
 
+# [FIX BUG-01] Referências fortes para tasks UDP criadas via asyncio.create_task.
+# O event loop mantém apenas referências fracas; sem este set, o GC pode coletar
+# a task antes de ela concluir, descartando telemetria/descoberta silenciosamente.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
 # Importa as classes do Protobuf geradas dinamicamente
 import messages_pb2  # pyright: ignore[reportMissingImports]
 
@@ -165,7 +170,12 @@ class SQLiteConnectionPool:
         try:
             yield db
         except Exception:
-            await db.rollback()
+            # [FIX A] Rollback encapsulado para não substituir a exceção original
+            # caso ele próprio falhe (ex.: conexão já fechada).
+            try:
+                await db.rollback()
+            except Exception as rollback_exc:
+                log.warning("Rollback SQLite falhou (conexão possivelmente inválida): %s", rollback_exc)
             raise
         finally:
             self._queue.put_nowait(db)
@@ -196,7 +206,8 @@ def get_telemetry_queue() -> asyncio.Queue:
 
 def ensure_metrics_index(cursor: sqlite3.Cursor):
     """Garante índices compatíveis com ingestão, retenção e consultas OLAP."""
-    cursor.execute("DROP INDEX IF EXISTS idx_metrics")
+    # [FIX QC-04] DROP INDEX removido — causava janela sem índice a cada restart.
+    # CREATE INDEX IF NOT EXISTS é idempotente e seguro.
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_metrics_metric_time_device
         ON metrics (metric_name, timestamp, device_id)
@@ -284,6 +295,12 @@ def init_db():
             is_controllable INTEGER,
             last_seen    INTEGER
         )
+    """)
+    # [FIX QC-07] Índice em last_seen: usado em device_offline_monitor_loop
+    # (UPDATE ... WHERE last_seen < ? AND status != ?), evita full-scan da tabela.
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_devices_last_seen
+        ON devices (last_seen)
     """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS metrics (
@@ -376,7 +393,11 @@ async def persist_telemetry_batch(batch: list[TelemetryEnvelope]):
 
     now = int(time.time())
     device_updates = {
-        envelope.device_id: (envelope.device_id, 0, envelope.status, envelope.ip, 0, now)
+        # [FIX INC-03] control_port=0 incluído explicitamente para evitar NULL quando
+        # a telemetria chega antes da mensagem de descoberta (race condition de rede).
+        # INSERT OR IGNORE garante que uma descoberta posterior sobrescreva via
+        # process_discovery (ON CONFLICT DO UPDATE com o valor real da porta).
+        envelope.device_id: (envelope.device_id, 0, envelope.status, envelope.ip, 0, 0, now)
         for envelope in batch
     }
     device_update_rows = [(now, row[2], row[0]) for row in device_updates.values()]
@@ -394,8 +415,8 @@ async def persist_telemetry_batch(batch: list[TelemetryEnvelope]):
 
     async with get_db_pool().connection() as db:
         await db.executemany("""
-            INSERT OR IGNORE INTO devices (device_id, type, status, ip_address, is_controllable, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO devices (device_id, type, status, ip_address, control_port, is_controllable, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, list(device_updates.values()))
 
         await db.executemany("""
@@ -487,6 +508,13 @@ async def process_discovery(disc: messages_pb2.DiscoveryResponse, ip: str):
     """Registra ou renova a presença de nós operacionais assincronamente."""
     now = int(time.time())
 
+    # [FIX INC-01] O campo ip_address do DiscoveryResponse agora é lido e utilizado.
+    # Estratégia: priorizar o hostname/IP anunciado pelo sensor (disc.ip_address) —
+    # em Docker, é um hostname DNS válido (e.g. "sensor_posto", "sensor_camera").
+    # Fallback para o IP de origem UDP quando o campo não for preenchido pelo sensor.
+    announced = disc.ip_address.strip() if disc.ip_address else ""
+    effective_ip = announced if announced else ip
+
     async with get_db_pool().connection() as db:
         async with db.execute(
             "SELECT 1 FROM devices WHERE device_id = ?",
@@ -505,16 +533,21 @@ async def process_discovery(disc: messages_pb2.DiscoveryResponse, ip: str):
                 control_port    = excluded.control_port,
                 is_controllable = excluded.is_controllable,
                 last_seen       = excluded.last_seen
-        """, (disc.device_id, disc.type, disc.initial_status, ip,
+        """, (disc.device_id, disc.type, disc.initial_status, effective_ip,
               disc.control_port, int(disc.is_controllable), now))
         await db.commit()
 
     if existing_device is None:
-        log.info("Nó registrado: '%s' em %s:%d (controlável=%s).",
-                 disc.device_id, ip, disc.control_port, disc.is_controllable)
+        log.info(
+            "Nó registrado: '%s' — rede=%s anunciado='%s' porta=%d (controlável=%s).",
+            disc.device_id, ip, announced or "<não informado>",
+            disc.control_port, disc.is_controllable,
+        )
     else:
-        log.debug("Heartbeat/topologia renovado: '%s' em %s:%d.",
-                  disc.device_id, ip, disc.control_port)
+        log.debug(
+            "Heartbeat/topologia renovado: '%s' — rede=%s anunciado='%s' porta=%d.",
+            disc.device_id, ip, announced or "<não informado>", disc.control_port,
+        )
 
 
 # ====================================================================
@@ -555,20 +588,25 @@ class TelemetryUDPProtocol(asyncio.DatagramProtocol):
                         return
 
                 # Evicção LRU: manter máximo de 1000 entradas em LAST_MESSAGE_INFO
-                if len(LAST_MESSAGE_INFO) >= 1000:
+                # [FIX QC-05] `while` em vez de `if` — garante que o dict nunca
+                # ultrapasse 1000 entradas mesmo em inserções simultâneas.
+                while len(LAST_MESSAGE_INFO) >= 1000:
                     LAST_MESSAGE_INFO.popitem(last=False)
                 
                 LAST_MESSAGE_INFO[payload.device_id] = (payload.timestamp, payload.message_id)
-                # Delega o I/O pesado de banco de dados para task background
-                asyncio.create_task(process_telemetry(payload, addr[0]))
+                # [FIX BUG-01] Guarda referência forte para evitar coleta pelo GC
+                # antes da task completar (event loop mantém apenas refs fracas).
+                task = asyncio.create_task(process_telemetry(payload, addr[0]))
+                _BACKGROUND_TASKS.add(task)
+                task.add_done_callback(_BACKGROUND_TASKS.discard)
                 log.debug(
                     "Pacote ID [%s] de '%s' — atraso %ds.",
                     payload.message_id, payload.device_id,
                     int(time.time()) - payload.timestamp,
                 )
                 return
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("Datagrama de telemetria inválido de %s: %s", addr, exc)
 
 
 class DiscoveryUDPProtocol(asyncio.DatagramProtocol):
@@ -586,7 +624,10 @@ class DiscoveryUDPProtocol(asyncio.DatagramProtocol):
 
             # Aceita dispositivos não-controláveis validando apenas o device_id
             if disc.device_id:
-                asyncio.create_task(process_discovery(disc, addr[0]))
+                # [FIX BUG-01] Idem: referência forte evita GC prematuro da task.
+                task = asyncio.create_task(process_discovery(disc, addr[0]))
+                _BACKGROUND_TASKS.add(task)
+                task.add_done_callback(_BACKGROUND_TASKS.discard)
         except Exception as e:
             log.error("Falha na decodificação de datagrama de Descoberta %s: %s", addr, e)
 
@@ -645,6 +686,10 @@ async def device_offline_monitor_loop():
     while True:
         try:
             cutoff = int(time.time() - DEVICE_OFFLINE_TIMEOUT_SECS)
+            # [FIX B] rowcount capturado dentro do bloco async with, enquanto a
+            # conexão ainda está checada para uso. Acessá-lo após o bloco é frágil
+            # pois a conexão pode ser reutilizada por outra corrotina.
+            marked_offline = 0
             async with get_db_pool().connection() as db:
                 cursor = await db.execute("""
                     UPDATE devices
@@ -652,11 +697,12 @@ async def device_offline_monitor_loop():
                     WHERE last_seen < ? AND status != ?
                 """, (messages_pb2.STATUS_OFF, cutoff, messages_pb2.STATUS_OFF))
                 await db.commit()
+                marked_offline = cursor.rowcount
 
-            if cursor.rowcount > 0:
+            if marked_offline > 0:
                 log.warning(
                     "%d dispositivo(s) sem heartbeat por mais de %.1fs marcados como offline.",
-                    cursor.rowcount, DEVICE_OFFLINE_TIMEOUT_SECS,
+                    marked_offline, DEVICE_OFFLINE_TIMEOUT_SECS,
                 )
         except asyncio.CancelledError:
             raise
@@ -769,46 +815,38 @@ async def fetch_graph_rows(
     end_timestamp: int,
     target_device_id: str = "",
 ) -> list[tuple[int, float, str]]:
+    # [FIX D] Query construída dinamicamente: elimina 4 branches quase idênticos
+    # (is_rollup × has_target_device_id). Comportamento idêntico ao original.
     query_start, query_end = olap_time_range(source, start_timestamp, end_timestamp)
 
+    params: list = [metric_name, query_start, query_end]
+    device_filter = ""
+    if target_device_id:
+        device_filter = "AND device_id = ?"
+        params.append(target_device_id)
+
     if source.is_rollup:
-        if target_device_id:
-            async with db.execute(f"""
-                SELECT bucket_start,
-                       value_sum / sample_count AS bucket_avg,
-                       device_id
-                FROM {source.table_name}
-                WHERE metric_name = ? AND bucket_start BETWEEN ? AND ? AND device_id = ?
-                ORDER BY bucket_start ASC, device_id ASC
-            """, (metric_name, query_start, query_end, target_device_id)) as cursor:
-                return [(int(ts), float(value), str(device_id)) for ts, value, device_id in await cursor.fetchall()]
-        else:
-            async with db.execute(f"""
-                SELECT bucket_start,
-                       value_sum / sample_count AS bucket_avg,
-                       device_id
-                FROM {source.table_name}
-                WHERE metric_name = ? AND bucket_start BETWEEN ? AND ?
-                ORDER BY bucket_start ASC, device_id ASC
-            """, (metric_name, query_start, query_end)) as cursor:
-                return [(int(ts), float(value), str(device_id)) for ts, value, device_id in await cursor.fetchall()]
+        query = f"""
+            SELECT bucket_start,
+                   value_sum / sample_count AS bucket_avg,
+                   device_id
+            FROM {source.table_name}
+            WHERE metric_name = ? AND bucket_start BETWEEN ? AND ? {device_filter}
+            ORDER BY bucket_start ASC, device_id ASC
+        """
     else:
-        if target_device_id:
-            async with db.execute("""
-                SELECT timestamp, value, device_id
-                FROM metrics
-                WHERE metric_name = ? AND timestamp BETWEEN ? AND ? AND device_id = ?
-                ORDER BY timestamp ASC
-            """, (metric_name, query_start, query_end, target_device_id)) as cursor:
-                return [(int(ts), float(value), str(device_id)) for ts, value, device_id in await cursor.fetchall()]
-        else:
-            async with db.execute("""
-                SELECT timestamp, value, device_id
-                FROM metrics
-                WHERE metric_name = ? AND timestamp BETWEEN ? AND ?
-                ORDER BY timestamp ASC
-            """, (metric_name, query_start, query_end)) as cursor:
-                return [(int(ts), float(value), str(device_id)) for ts, value, device_id in await cursor.fetchall()]
+        query = f"""
+            SELECT timestamp, value, device_id
+            FROM metrics
+            WHERE metric_name = ? AND timestamp BETWEEN ? AND ? {device_filter}
+            ORDER BY timestamp ASC
+        """
+
+    async with db.execute(query, params) as cursor:
+        return [
+            (int(ts), float(value), str(device_id))
+            for ts, value, device_id in await cursor.fetchall()
+        ]
 
 
 async def execute_olap_from_source(
@@ -816,49 +854,47 @@ async def execute_olap_from_source(
     req: messages_pb2.ClientRequest,
     source: OlapSource,
 ) -> OlapQueryResult:
+    # [FIX E] Queries construídas dinamicamente com base em (is_rollup × target_device_id).
+    # Elimina 8 branches quase idênticos; comportamento idêntico ao original.
     query_start, query_end = olap_time_range(source, req.start_timestamp, req.end_timestamp)
 
-    if req.query_op in (messages_pb2.OP_AVERAGE, messages_pb2.OP_STD_DEV):
-        if source.is_rollup:
-            if req.target_device_id:
-                async with db.execute(f"""
-                    SELECT COALESCE(SUM(sample_count), 0),
-                           COALESCE(SUM(value_sum), 0.0),
-                           COALESCE(SUM(value_sum_sq), 0.0)
-                    FROM {source.table_name}
-                    WHERE metric_name = ? AND bucket_start BETWEEN ? AND ? AND device_id = ?
-                """, (req.query_metric, query_start, query_end, req.target_device_id)) as cursor:
-                    sample_count, value_sum, value_sum_sq = await cursor.fetchone()
-            else:
-                async with db.execute(f"""
-                    SELECT COALESCE(SUM(sample_count), 0),
-                           COALESCE(SUM(value_sum), 0.0),
-                           COALESCE(SUM(value_sum_sq), 0.0)
-                    FROM {source.table_name}
-                    WHERE metric_name = ? AND bucket_start BETWEEN ? AND ?
-                """, (req.query_metric, query_start, query_end)) as cursor:
-                    sample_count, value_sum, value_sum_sq = await cursor.fetchone()
-        else:
-            if req.target_device_id:
-                async with db.execute("""
-                    SELECT COUNT(*),
-                           COALESCE(SUM(value), 0.0),
-                           COALESCE(SUM(value * value), 0.0)
-                    FROM metrics
-                    WHERE metric_name = ? AND timestamp BETWEEN ? AND ? AND device_id = ?
-                """, (req.query_metric, query_start, query_end, req.target_device_id)) as cursor:
-                    sample_count, value_sum, value_sum_sq = await cursor.fetchone()
-            else:
-                async with db.execute("""
-                    SELECT COUNT(*),
-                           COALESCE(SUM(value), 0.0),
-                           COALESCE(SUM(value * value), 0.0)
-                    FROM metrics
-                    WHERE metric_name = ? AND timestamp BETWEEN ? AND ?
-                """, (req.query_metric, query_start, query_end)) as cursor:
-                    sample_count, value_sum, value_sum_sq = await cursor.fetchone()
+    # Fragmentos que diferem entre rollup e raw
+    if source.is_rollup:
+        time_col    = "bucket_start"
+        count_col   = "SUM(sample_count)"
+        sum_col     = "SUM(value_sum)"
+        sumsq_col   = "SUM(value_sum_sq)"
+        min_col     = "MIN(value_min)"
+        max_col     = "MAX(value_max)"
+    else:
+        time_col    = "timestamp"
+        count_col   = "COUNT(*)"
+        sum_col     = "COALESCE(SUM(value), 0.0)"
+        sumsq_col   = "COALESCE(SUM(value * value), 0.0)"
+        min_col     = "MIN(value)"
+        max_col     = "MAX(value)"
 
-        sample_count = int(sample_count or 0)
+    # Filtro de dispositivo opcional
+    params_base: list = [req.query_metric, query_start, query_end]
+    device_filter = ""
+    if req.target_device_id:
+        device_filter = "AND device_id = ?"
+        params_base.append(req.target_device_id)
+
+    if req.query_op in (messages_pb2.OP_AVERAGE, messages_pb2.OP_STD_DEV):
+        async with db.execute(f"""
+            SELECT COALESCE({count_col}, 0),
+                   COALESCE({sum_col}, 0.0),
+                   COALESCE({sumsq_col}, 0.0)
+            FROM {source.table_name}
+            WHERE metric_name = ? AND {time_col} BETWEEN ? AND ? {device_filter}
+        """, params_base) as cursor:
+            row = await cursor.fetchone()
+
+        sample_count = int(row[0] or 0)
+        value_sum    = float(row[1] or 0.0)
+        value_sum_sq = float(row[2] or 0.0)
+
         if sample_count == 0:
             return OlapQueryResult(
                 success=False,
@@ -870,9 +906,9 @@ async def execute_olap_from_source(
             )
 
         if req.query_op == messages_pb2.OP_AVERAGE:
-            analytics_result = float(value_sum) / sample_count
+            analytics_result = value_sum / sample_count
         else:
-            analytics_result = sample_stddev(sample_count, float(value_sum), float(value_sum_sq))
+            analytics_result = sample_stddev(sample_count, value_sum, value_sum_sq)
 
         graph_rows = await fetch_graph_rows(
             db, source, req.query_metric, req.start_timestamp, req.end_timestamp, req.target_device_id,
@@ -891,56 +927,17 @@ async def execute_olap_from_source(
         )
 
     if req.query_op == messages_pb2.OP_MAX_VARIATION:
-        if source.is_rollup:
-            if req.target_device_id:
-                async with db.execute(f"""
-                    SELECT device_id,
-                           SUM(sample_count) AS total_count,
-                           MIN(value_min) AS min_value,
-                           MAX(value_max) AS max_value
-                    FROM {source.table_name}
-                    WHERE metric_name = ? AND bucket_start BETWEEN ? AND ? AND device_id = ?
-                    GROUP BY device_id
-                    HAVING SUM(sample_count) > 1
-                """, (req.query_metric, query_start, query_end, req.target_device_id)) as cursor:
-                    variation_rows = await cursor.fetchall()
-            else:
-                async with db.execute(f"""
-                    SELECT device_id,
-                           SUM(sample_count) AS total_count,
-                           MIN(value_min) AS min_value,
-                           MAX(value_max) AS max_value
-                    FROM {source.table_name}
-                    WHERE metric_name = ? AND bucket_start BETWEEN ? AND ?
-                    GROUP BY device_id
-                    HAVING SUM(sample_count) > 1
-                """, (req.query_metric, query_start, query_end)) as cursor:
-                    variation_rows = await cursor.fetchall()
-        else:
-            if req.target_device_id:
-                async with db.execute("""
-                    SELECT device_id,
-                           COUNT(*) AS total_count,
-                           MIN(value) AS min_value,
-                           MAX(value) AS max_value
-                    FROM metrics
-                    WHERE metric_name = ? AND timestamp BETWEEN ? AND ? AND device_id = ?
-                    GROUP BY device_id
-                    HAVING COUNT(*) > 1
-                """, (req.query_metric, query_start, query_end, req.target_device_id)) as cursor:
-                    variation_rows = await cursor.fetchall()
-            else:
-                async with db.execute("""
-                    SELECT device_id,
-                           COUNT(*) AS total_count,
-                           MIN(value) AS min_value,
-                           MAX(value) AS max_value
-                    FROM metrics
-                    WHERE metric_name = ? AND timestamp BETWEEN ? AND ?
-                    GROUP BY device_id
-                    HAVING COUNT(*) > 1
-                """, (req.query_metric, query_start, query_end)) as cursor:
-                    variation_rows = await cursor.fetchall()
+        async with db.execute(f"""
+            SELECT device_id,
+                   {count_col} AS total_count,
+                   {min_col}   AS min_value,
+                   {max_col}   AS max_value
+            FROM {source.table_name}
+            WHERE metric_name = ? AND {time_col} BETWEEN ? AND ? {device_filter}
+            GROUP BY device_id
+            HAVING {count_col} > 1
+        """, params_base) as cursor:
+            variation_rows = await cursor.fetchall()
 
         if not variation_rows:
             return OlapQueryResult(
@@ -957,8 +954,8 @@ async def execute_olap_from_source(
             key=lambda row: float(row[3]) - float(row[2]),
         )
         max_variation = float(max_value) - float(min_value)
-        sample_count = sum(int(row[1]) for row in variation_rows)
-        graph_rows = await fetch_graph_rows(
+        sample_count  = sum(int(row[1]) for row in variation_rows)
+        graph_rows    = await fetch_graph_rows(
             db, source, req.query_metric, req.start_timestamp, req.end_timestamp, req.target_device_id,
         )
         bucket_label = f", bucket={source.bucket_size}s" if source.is_rollup else ""
@@ -1197,6 +1194,16 @@ async def handle_client_request(reader: asyncio.StreamReader, writer: asyncio.St
                 log.warning("Falha SQLite processando requisição de %s: %s", peer, exc)
                 resp = new_client_response(success=False)
                 resp.message = f"Falha SQLite no Gateway: {exc}"
+            except Exception as exc:
+                # [FIX C] Captura exceções inesperadas (ex.: AttributeError, TypeError)
+                # que escapariam para o handler de conexão e encerrariam o canal TCP
+                # sem enviar resposta ao cliente.
+                log.error(
+                    "Erro inesperado processando requisição de %s: %s",
+                    peer, exc, exc_info=True,
+                )
+                resp = new_client_response(success=False)
+                resp.message = "Erro interno no Gateway — consulte os logs do servidor."
             await send_client_response(writer, resp)
 
     except (ConnectionResetError, BrokenPipeError) as exc:
@@ -1263,6 +1270,14 @@ async def main():
         async with server:
             await server.serve_forever()
     finally:
+        # [FIX F] Cancela tasks UDP em voo (telemetria/descoberta) antes de fechar
+        # os transportes e o pool. Sem isso, tasks que chegaram no último instante
+        # podem tentar acessar o pool já encerrado.
+        for task in list(_BACKGROUND_TASKS):
+            task.cancel()
+        if _BACKGROUND_TASKS:
+            await asyncio.gather(*_BACKGROUND_TASKS, return_exceptions=True)
+
         probe_task.cancel()
         checkpoint_task.cancel()
         offline_task.cancel()

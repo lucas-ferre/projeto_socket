@@ -15,16 +15,18 @@ services:
       - "5002:5002/udp"  # Registro de descoberta de sensores externos
       - "5005:5005/udp"  # Canal multicast de descoberta de topologia
     volumes:
-      - gateway_db:/app/db
+      - gateway_db:/app/gateway/db
     environment:
-      - PYTHONUNBUFFERED=1  # Garante que os logs sejam exibidos em tempo real (comportamento equivalente aos sensores C, Lua e Java)
+      - PYTHONUNBUFFERED=1
     networks:
       - smart_city_net
     restart: always
-    # Implementação de checagem ativa de prontidão na camada de transporte
+    # asyncio cancela tasks e fecha o pool SQLite no SIGTERM —
+    # 10s garante que o WAL checkpoint final seja escrito antes do SIGKILL.
+    stop_grace_period: 10s
     healthcheck:
       test: [
-        "CMD-SHELL", 
+        "CMD-SHELL",
         "python -c 'import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1.0); s.connect((\"127.0.0.1\", 5001)); s.close()' || exit 1"
       ]
       interval: 5s
@@ -36,26 +38,28 @@ services:
   # 2. SENSOR DE CLIMA (NÓ C - CONTÍNUO)
   # ==================================================================
   sensor_clima:
-    environment:
-    - C_DEVICE_COUNT=6  # Configura o número de dispositivos simulados (ajustável sem recompilação)
     build:
       context: .
       dockerfile: sensor_c/Dockerfile
       args:
         TARGET_SERVICE: sensor_clima
     container_name: sensor_clima
-    # Condiciona a inicialização à integridade atestada do coordenador
+    environment:
+      - C_DEVICE_COUNT=6  # Número de dispositivos simulados (ajustável sem recompilação)
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
     restart: on-failure
+    # sig_atomic_t keep_running + sigaction(SIGTERM) garantem saída limpa em < 1s.
+    stop_grace_period: 5s
     healthcheck:
-      test: [
-        "CMD-SHELL",
-        "test -r /proc/1/cmdline && grep -zq sensor_c /proc/1/cmdline"
-      ]
+      # O sensor C não expõe nenhuma porta TCP (não controlável).
+      # kill -0 verifica se PID 1 existe e está responsivo a sinais —
+      # mais robusto que inspecionar /proc/1/cmdline, que passaria para
+      # qualquer processo cujo nome contenha "sensor_c".
+      test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -71,25 +75,26 @@ services:
       args:
         TARGET_SERVICE: sensor_posto
     container_name: sensor_posto
-    # Garante que o nó só despache a descoberta quando o Gateway puder ouvir
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
     restart: on-failure
+    # posix.signal(SIGTERM) via luaposix seta keep_running=false;
+    # teardown envia STATUS_OFF e fecha sockets em < 1s.
+    stop_signal: SIGTERM
+    stop_grace_period: 5s
     healthcheck:
-      test: [
-        "CMD-SHELL",
-        "bash -c '</dev/tcp/127.0.0.1/5002'"
-      ]
+      # CONTROL_TCP_PORT = 5006 (sensor_lua/sensor.lua)
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/5006'"]
       interval: 10s
       timeout: 3s
       retries: 3
       start_period: 5s
 
-# ==================================================================
-  # 4. SEMAFORO (NÓ JAVA - CONTÍNUO)
+  # ==================================================================
+  # 4. SEMÁFORO (NÓ JAVA - CONTROLÁVEL)
   # ==================================================================
   sensor_java:
     build:
@@ -104,11 +109,11 @@ services:
     networks:
       - smart_city_net
     restart: on-failure
+    # Thread.interrupt() propaga para os loops de telemetria e TCP,
+    # encerrando ordenadamente em < 1s.
+    stop_grace_period: 5s
     healthcheck:
-      test: [
-        "CMD-SHELL",
-        "bash -c '</dev/tcp/127.0.0.1/5003'"
-      ]
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/5003'"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -125,13 +130,15 @@ services:
         TARGET_SERVICE: sensor_camera
     container_name: sensor_camera
     environment:
-      - PYTHONUNBUFFERED=1  # Força flush imediato do stdout/stderr (comportamento equivalente aos sensores C, Lua e Java)
+      - PYTHONUNBUFFERED=1
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
     restart: on-failure
+    # signal.signal(SIGTERM) seta shutdown_event; threads encerram em < 1s.
+    stop_grace_period: 5s
     healthcheck:
       test: [
         "CMD-SHELL",
@@ -153,13 +160,14 @@ services:
         TARGET_SERVICE: dashboard
     container_name: dashboard
     ports:
-      - "8501:8501" # Interface visual exposta
+      - "8501:8501"
     depends_on:
       gateway:
         condition: service_healthy
     networks:
       - smart_city_net
     restart: on-failure
+    stop_grace_period: 5s
     healthcheck:
       test: [
         "CMD-SHELL",

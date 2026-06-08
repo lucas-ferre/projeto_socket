@@ -1,5 +1,6 @@
 import streamlit as st
 import socket
+import os
 import time
 import struct
 import uuid
@@ -19,8 +20,8 @@ import messages_pb2 # pyright: ignore[reportMissingImports]
 # CONFIGURAÇÕES DE REDE E TRANSPORTE TCP
 # ====================================================================
 
-GATEWAY_HOST = "gateway"
-GATEWAY_PORT = 5001
+GATEWAY_HOST = os.getenv("GATEWAY_HOST", "gateway")
+GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "5001"))
 
 # [B2/M1] TTL do cache de status do gateway (segundos)
 # Evita probe TCP bloqueante a cada rerender do Streamlit.
@@ -254,6 +255,22 @@ def send_tcp_request(request: messages_pb2.ClientRequest) -> messages_pb2.Client
         st.error(f"{result.error_code}: {result.error_message}")
     return None
 
+
+def _device_to_dict(d) -> dict:
+    """[FIX QC-03] Converte DeviceInfo protobuf para dict Python simples.
+    Armazenar dicts em session_state evita mutação de objetos protobuf e elimina
+    dependência de ciclo de vida do GC sobre mensagens filho de `resp`.
+    """
+    return {
+        "device_id":          d.device_id,
+        "type":               int(d.type),
+        "status":             int(d.status),
+        "ip_address":         d.ip_address,
+        "control_port":       int(d.control_port),
+        "is_controllable":    bool(d.is_controllable),
+        "last_seen_timestamp": int(d.last_seen_timestamp),
+    }
+
 def check_gateway_status() -> bool:
     """Atesta a vitalidade do Gateway reaproveitando o canal TCP persistente."""
     client = get_gateway_client()
@@ -399,6 +416,19 @@ if 'gw_last_check' not in st.session_state:
     st.session_state.gw_last_check = 0.0
 if 'gw_status' not in st.session_state:
     st.session_state.gw_status = False
+# [FIX QC-08] Mensagem da última sincronização de topologia (Aba 1)
+if 'last_list_msg' not in st.session_state:
+    st.session_state.last_list_msg = None
+# [FIX QC-08] Resultado da última query OLAP (Aba 3)
+if 'olap_result' not in st.session_state:
+    st.session_state.olap_result = None
+if 'olap_context' not in st.session_state:
+    st.session_state.olap_context = None
+# [FIX QC-08] Resultado da última inspeção individual (Aba 4)
+if 'inspection_result' not in st.session_state:
+    st.session_state.inspection_result = None
+if 'inspection_context' not in st.session_state:
+    st.session_state.inspection_context = None
 
 # ====================================================================
 # SIDEBAR
@@ -420,7 +450,7 @@ with st.sidebar:
 
     sensor_count = len(st.session_state.device_history) if st.session_state.device_history else "N/A"
     col2.metric("Sensores", sensor_count, help="Atualizar na aba Descoberta")
-    col3.metric("Hora UTC", datetime.datetime.utcnow().strftime('%H:%M:%S'))
+    col3.metric("Hora UTC", datetime.datetime.now(datetime.timezone.utc).strftime('%H:%M:%S'))
     st.markdown("---")
     st.info("💡 Selecione uma aba para iniciar operações na rede.")
 
@@ -438,66 +468,83 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # --------------------------------------------------------------------
 with tab1:
     st.subheader("📡 Nós Operacionais Registrados no Gateway")
-    
-    col_btn, col_refresh = st.columns([3, 1])
-    with col_btn:
-        if st.button("Atualizar Topologia de Rede", type="primary", use_container_width=True):
-            req = messages_pb2.ClientRequest()
-            req.type = messages_pb2.REQUEST_TYPE_LIST_DEVICES
-            
-            with st.spinner("Sincronizando inventário via Socket TCP..."):
-                resp = send_tcp_request(req)
-                
-            if resp and resp.success:
-                # [B3] list() materializa o RepeatedCompositeContainer em lista Python
-                # independente. Sem isso, device_history aponta para o container filho
-                # de resp — se resp for coletado pelo GC, os objetos ficam inválidos.
-                st.session_state.device_history = list(resp.devices)
-                if not resp.devices:
-                    st.info("✓ Nenhum dispositivo descoberto pelo Gateway até o momento.")
-                else:
-                    st.success(f"✓ {len(resp.devices)} nó(s) identificado(s) com sucesso.")
-            elif resp:
-                st.warning(f"⚠️ Alerta do Barramento: {resp.message}")
+
+    # [FIX QC-08] Consome resultado de sincronização enviada em background.
+    # O padrão submit→rerun→consume mantém a UI responsiva durante o I/O TCP.
+    completed_list = consume_tcp_task("list_devices_task", "Sincronização de topologia")
+    if completed_list:
+        result, _ = completed_list
+        resp = result.response
+        if resp and resp.success:
+            # [FIX QC-03] Armazena como dicts Python — elimina mutação de objetos
+            # protobuf e dependência do ciclo de vida de `resp` no GC.
+            st.session_state.device_history = [_device_to_dict(d) for d in resp.devices]
+            if not resp.devices:
+                st.session_state.last_list_msg = ("info", "✓ Nenhum dispositivo descoberto pelo Gateway até o momento.")
             else:
-                st.error("❌ Link TCP inativo. Falha de comunicação com o Gateway.")
-    
+                st.session_state.last_list_msg = ("success", f"✓ {len(resp.devices)} nó(s) identificado(s) com sucesso.")
+        elif resp:
+            st.session_state.last_list_msg = ("warning", f"⚠️ Alerta do Barramento: {resp.message}")
+        else:
+            st.session_state.last_list_msg = ("error", f"❌ Link TCP inativo. {result.error_code}: {result.error_message}")
+        st.rerun()
+
+    # [FIX QC-01] col_refresh removida — era uma coluna vazia nunca utilizada.
+    # use_container_width=True já garante botão com largura total.
+    if st.button("Atualizar Topologia de Rede", type="primary", use_container_width=True,
+                 disabled=is_tcp_task_pending("list_devices_task")):
+        req = messages_pb2.ClientRequest()
+        req.type = messages_pb2.REQUEST_TYPE_LIST_DEVICES
+        submit_tcp_request("list_devices_task", req, {})
+        st.session_state.last_list_msg = None
+        st.rerun()
+
+    # Exibe feedback da última operação
+    if st.session_state.last_list_msg:
+        kind, msg = st.session_state.last_list_msg
+        {"success": st.success, "warning": st.warning,
+         "error": st.error, "info": st.info}[kind](msg)
+
     if st.session_state.device_history:
         device_data = []
         for d in st.session_state.device_history:
+            # [FIX QC-03] Acesso via dict — os dados são agora dicts Python simples.
             device_data.append({
-                "ID": d.device_id,
-                "Setor Geográfico": infer_sector_from_device_id(d.device_id),
-                "Classe do Dispositivo": TYPE_MAP.get(d.type, "Desconhecido"),
-                "Status Atual": STATUS_MAP.get(d.status, "Desconhecido"),
-                "Ponto de Entrada": f"{d.ip_address}:{d.control_port}" if d.is_controllable else f"{d.ip_address} (Somente UDP)",
-                "Permite Controle": "✓ Sim" if d.is_controllable else "✗ Não",
-                "Último ACK": datetime.datetime.fromtimestamp(d.last_seen_timestamp).strftime('%H:%M:%S')
+                "ID": d["device_id"],
+                "Setor Geográfico": infer_sector_from_device_id(d["device_id"]),
+                "Classe do Dispositivo": TYPE_MAP.get(d["type"], "Desconhecido"),
+                "Status Atual": STATUS_MAP.get(d["status"], "Desconhecido"),
+                "Ponto de Entrada": (
+                    f"{d['ip_address']}:{d['control_port']}" if d["is_controllable"]
+                    else f"{d['ip_address']} (Somente UDP)"
+                ),
+                "Permite Controle": "✓ Sim" if d["is_controllable"] else "✗ Não",
+                "Último ACK": datetime.datetime.fromtimestamp(d["last_seen_timestamp"]).strftime('%H:%M:%S')
             })
-        
+
         df = pd.DataFrame(device_data)
         st.dataframe(df, use_container_width=True, hide_index=True)
-        
+
         st.divider()
         col_graph, col_stats = st.columns([2, 1])
-        
+
         with col_graph:
             status_counts = defaultdict(int)
             for d in st.session_state.device_history:
-                status_label = STATUS_MAP.get(d.status, "Desconhecido")
+                status_label = STATUS_MAP.get(d["status"], "Desconhecido")
                 status_counts[status_label] += 1
-            
+
             if status_counts:
                 st.bar_chart(pd.DataFrame([
                     {"Status da Frota": status, "Nós": count}
                     for status, count in status_counts.items()
                 ]).set_index("Status da Frota"))
-        
+
         with col_stats:
             st.metric("Total de Nós Indexados", len(st.session_state.device_history))
-            online_count = sum(1 for d in st.session_state.device_history if d.status == messages_pb2.STATUS_ON)
+            online_count = sum(1 for d in st.session_state.device_history if d["status"] == messages_pb2.STATUS_ON)
             st.metric("Instâncias Operacionais (ONLINE)", online_count)
-            controllable_count = sum(1 for d in st.session_state.device_history if d.is_controllable)
+            controllable_count = sum(1 for d in st.session_state.device_history if d["is_controllable"])
             st.metric("Interfaces de Atuação Disponíveis", controllable_count)
 
 # --------------------------------------------------------------------
@@ -509,8 +556,8 @@ with tab2:
     if not st.session_state.device_history:
         st.info("Topologia desconhecida. Sincronize a rede na aba 'Fontes de Dados'.")
     else:
-        controllable_devices = [d for d in st.session_state.device_history if d.is_controllable]
-        device_ids = [d.device_id for d in controllable_devices]
+        controllable_devices = [d for d in st.session_state.device_history if d["is_controllable"]]
+        device_ids = [d["device_id"] for d in controllable_devices]
         
         if not device_ids:
             st.warning("Nenhum dispositivo controlável disponível. Sincronize a topologia primeiro.")
@@ -522,26 +569,21 @@ with tab2:
                     st.session_state.selected_device_id = device_ids[0]
                 
                 # [R7] Parâmetro index= removido — conflitava silenciosamente com key=.
-                # Quando key= está presente, o Streamlit usa session_state[key] como
-                # valor do widget; index= é ignorado após o primeiro render e pode
-                # divergir do estado real em edge cases de reordenação da lista.
-                # O guard acima (selected_device_id not in device_ids) já garante
-                # que session_state contém sempre um valor válido antes do widget renderizar.
                 target_id = st.selectbox(
                     "Selecione o Nó Alvo de Atuação", 
                     options=device_ids,
                     key="selected_device_id"
                 )
                 
-                selected_device = next((d for d in controllable_devices if d.device_id == target_id), None)
+                selected_device = next((d for d in controllable_devices if d["device_id"] == target_id), None)
             
             if selected_device:
                 with col_det:
                     st.markdown(f"""
                     **Tabela de Assinatura do Nó:**
-                    - **Classificação:** `{TYPE_MAP.get(selected_device.type, "Desconhecido")}`
-                    - **Socket Escuta:** `{selected_device.ip_address}:{selected_device.control_port}`
-                    - **Estado Local:** `{STATUS_MAP.get(selected_device.status, "Desconhecido")}`
+                    - **Classificação:** `{TYPE_MAP.get(selected_device["type"], "Desconhecido")}`
+                    - **Socket Escuta:** `{selected_device["ip_address"]}:{selected_device["control_port"]}`
+                    - **Estado Local:** `{STATUS_MAP.get(selected_device["status"], "Desconhecido")}`
                     """)
 
                 st.divider()
@@ -567,11 +609,11 @@ with tab2:
                 with c1:
                     alterar_status = st.checkbox("Engatilhar Mutação de Estado", value=False)
                     
-                    if selected_device.type == messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT:
+                    if selected_device["type"] == messages_pb2.DEVICE_TYPE_TRAFFIC_LIGHT:
                         status_options = ["Ligar (VERDE)", "Desligar (OFF)", "Emergência (PISCANTE)"]
-                    elif selected_device.type == messages_pb2.DEVICE_TYPE_LAMP_POST:
+                    elif selected_device["type"] == messages_pb2.DEVICE_TYPE_LAMP_POST:
                         status_options = ["Acender Relé (ON)", "Cortar Relé (OFF)", "Modo Manutenção (ERR)"]
-                    elif selected_device.type == messages_pb2.DEVICE_TYPE_CAMERA: 
+                    elif selected_device["type"] == messages_pb2.DEVICE_TYPE_CAMERA:
                         status_options = ["Gravar Stream (ON)", "Pausar Stream (OFF)", "Diagnóstico Binário (ERR)"]
                     else:
                         status_options = ["Ativar", "Desativar", "Provocar Falha"]
@@ -602,11 +644,14 @@ with tab2:
                         })
 
                         if resp.success:
+                            # [FIX QC-03] Mutação sobre dict Python — segura e explícita.
+                            # Antes mutava campos de objeto protobuf armazenado em session_state,
+                            # o que é dependente de implementação e não thread-safe.
                             for device in st.session_state.device_history:
-                                if device.device_id == context["target_id"]:
+                                if device["device_id"] == context["target_id"]:
                                     if context["update_status"]:
-                                        device.status = context["target_status"]
-                                    device.last_seen_timestamp = int(time.time())
+                                        device["status"] = context["target_status"]
+                                    device["last_seen_timestamp"] = int(time.time())
                                     break
 
                             st.session_state.last_cmd_result = {"type": "success", "message": resp.message}
@@ -692,16 +737,16 @@ with tab2:
 # --------------------------------------------------------------------
 with tab3:
     st.subheader("📊 Agregação Analítica Servidor-Lado (SQLite WAL)")
-    
+
     c_op, c_met, c_time = st.columns(3)
-    
+
     with c_op:
         operacao = st.selectbox("Função de Avaliação Numérica", [
             ("📈 Média Aritmética Amostral", messages_pb2.OP_AVERAGE),
             ("📊 Desvio Padrão Populacional", messages_pb2.OP_STD_DEV),
             ("🔀 Cálculo de Maior Variação Geográfica", messages_pb2.OP_MAX_VARIATION),
         ], format_func=lambda x: x[0])
-        
+
     with c_met:
         metrica_alvo = st.selectbox("Vetor de Telemetria", [
             ("🌡️ Temperatura (°C)",              "temperature"),
@@ -716,89 +761,107 @@ with tab3:
             ("📸 Taxa de Infrações Corrente",    "infractions"),
             ("🚥 Fila Semafórica (veículos)",    "queue_length"),
         ], format_func=lambda x: x[0])
-        
+
     with c_time:
         janela_horas = st.slider("Fatia Temporal Histórica (Horas passadas)", min_value=1, max_value=24, value=1)
 
-    if st.button("Disparar Query ao Gateway", type="primary", use_container_width=True):
+    # [FIX QC-08] Consome resultado OLAP enviado em background.
+    completed_olap = consume_tcp_task("olap_task", "Query OLAP")
+    if completed_olap:
+        result, context = completed_olap
+        st.session_state.olap_result = result.response
+        st.session_state.olap_context = context
+        st.rerun()
+
+    if st.button("Disparar Query ao Gateway", type="primary", use_container_width=True,
+                 disabled=is_tcp_task_pending("olap_task")):
         req = messages_pb2.ClientRequest()
         req.type = messages_pb2.REQUEST_TYPE_ANALYTICS_QUERY
         req.query_op = operacao[1]
         req.query_metric = metrica_alvo[1]
-        
-        # Resolução vetorial do tempo via UNIX Epochs
         agora = int(time.time())
         req.end_timestamp = agora
         req.start_timestamp = agora - (janela_horas * 3600)
-        
-        with st.spinner(f"⏳ Processando {operacao[0].lower()} e extraindo grafos..."):
-            resp = send_tcp_request(req)
-            
-        if resp:
-            if resp.success:
-                st.divider()
-                
-                col_result, col_metadata = st.columns([2, 1])
-                
-                with col_result:
-                    icon  = METRIC_ICONS.get(metrica_alvo[1], "📊")
-                    unit  = METRIC_UNITS.get(metrica_alvo[1], "")
-                    value = resp.analytics_result
-                    
-                    label_desc = operacao[0].split(" ")[1] if "Maior" not in operacao[0] else "Variação"
-                    st.metric(label=f"{icon} {label_desc} Agregada — {metrica_alvo[0]}",
-                              value=f"{value:.2f} {unit}".strip())
+        submit_tcp_request("olap_task", req, {
+            "operacao": operacao,
+            "metrica_alvo": metrica_alvo,
+            "janela_horas": janela_horas,
+        })
+        st.session_state.olap_result = None
+        st.rerun()
 
-                    # Contextualização Paramétrica
-                    ref_range = get_metric_reference_range(metrica_alvo[1])
-                    if metrica_alvo[1] == "aqi":
-                        st.info(f"**Detecção Automática AQI:** {aqi_category(value)}  \n"
-                                "(Base EPA): 0-50 Bom · 51-100 Moderado · 101-150 Sensíveis · 151-200 Insalubre")
-                    elif "safe" in ref_range and "warning" in ref_range:
-                        safe_min, safe_max = ref_range["safe"]
-                        warn_min, warn_max = ref_range["warning"]
-                        
-                        if safe_min <= value <= safe_max:
-                            st.success(f"**🟢 Estável: Parâmetro operando no envelope seguro.**\n\n{ref_range.get('description', '')}")
-                        elif warn_min <= value <= warn_max:
-                            st.warning(f"**🟡 Atenção: Desvio tolerável do ideal.**\n\n{ref_range.get('description', '')}")
-                        else:
-                            st.error(f"**🔴 Crítico: Integridade térmica/física comprometida.**\n\n{ref_range.get('description', '')}")
-                    
-                    # FIX 4: Desenho da Linha Temporal Nativa (Isolado de sessões fantasma)
-                    st.subheader(f"📈 Extração do Histórico Contínuo ({janela_horas}h)")
-                    
-                    if len(resp.graph_points) > 0:
-                        chart_data = pd.DataFrame([
-                            {
-                                "Eixo X": datetime.datetime.fromtimestamp(pt.timestamp).strftime("%H:%M:%S"),
-                                "Grandeza Física": pt.value,
-                                "MAC Address / ID": pt.device_id
-                            }
-                            for pt in resp.graph_points
-                        ])
-                        
-                        # Pivotagem protegida contra colisões atômicas do log UDP (agrupamento aritmético do milissegundo)
-                        chart_pivot = pd.pivot_table(
-                            chart_data, 
-                            index="Eixo X", 
-                            columns="MAC Address / ID", 
-                            values="Grandeza Física",
-                            aggfunc="mean"
-                        )
-                        
-                        st.line_chart(chart_pivot, use_container_width=True, height=360)
+    # Renderiza resultado armazenado (persiste entre rerenders)
+    resp = st.session_state.olap_result
+    ctx  = st.session_state.olap_context
+    if resp and ctx:
+        op_ctx      = ctx["operacao"]
+        metrica_ctx = ctx["metrica_alvo"]
+        janela_ctx  = ctx["janela_horas"]
+
+        if resp.success:
+            st.divider()
+
+            col_result, col_metadata = st.columns([2, 1])
+
+            with col_result:
+                icon  = METRIC_ICONS.get(metrica_ctx[1], "📊")
+                unit  = METRIC_UNITS.get(metrica_ctx[1], "")
+                value = resp.analytics_result
+
+                label_desc = op_ctx[0].split(" ")[1] if "Maior" not in op_ctx[0] else "Variação"
+                st.metric(label=f"{icon} {label_desc} Agregada — {metrica_ctx[0]}",
+                          value=f"{value:.2f} {unit}".strip())
+
+                # Contextualização Paramétrica
+                ref_range = get_metric_reference_range(metrica_ctx[1])
+                if metrica_ctx[1] == "aqi":
+                    st.info(f"**Detecção Automática AQI:** {aqi_category(value)}  \n"
+                            "(Base EPA): 0-50 Bom · 51-100 Moderado · 101-150 Sensíveis · 151-200 Insalubre")
+                elif "safe" in ref_range and "warning" in ref_range:
+                    safe_min, safe_max = ref_range["safe"]
+                    warn_min, warn_max = ref_range["warning"]
+
+                    if safe_min <= value <= safe_max:
+                        st.success(f"**🟢 Estável: Parâmetro operando no envelope seguro.**\n\n{ref_range.get('description', '')}")
+                    elif warn_min <= value <= warn_max:
+                        st.warning(f"**🟡 Atenção: Desvio tolerável do ideal.**\n\n{ref_range.get('description', '')}")
                     else:
-                        st.info("📋 Base de dados desprovida de medições brutas no intervalo de amostragem requisitado.")
-                
-                with col_metadata:
-                    st.info(f"📋 **Estatística da Extração SQL:**\n\n{resp.result_metadata}\n\n**Escopo Analítico:**\n{janela_horas} hora(s)")
-                    st.caption(f"**Token de Assinatura (ID):** {resp.message_id}")
-                    st.caption(f"**Geração do Report:** {datetime.datetime.fromtimestamp(resp.timestamp).strftime('%H:%M:%S')}")
-            else:
-                st.warning(f"⚠️ Restrição Computacional do Gateway: {resp.message}")
+                        st.error(f"**🔴 Crítico: Integridade térmica/física comprometida.**\n\n{ref_range.get('description', '')}")
+
+                # FIX 4: Desenho da Linha Temporal Nativa (Isolado de sessões fantasma)
+                st.subheader(f"📈 Extração do Histórico Contínuo ({janela_ctx}h)")
+
+                if len(resp.graph_points) > 0:
+                    chart_data = pd.DataFrame([
+                        {
+                            "Eixo X": datetime.datetime.fromtimestamp(pt.timestamp).strftime("%H:%M:%S"),
+                            "Grandeza Física": pt.value,
+                            "MAC Address / ID": pt.device_id
+                        }
+                        for pt in resp.graph_points
+                    ])
+
+                    # Pivotagem protegida contra colisões atômicas do log UDP (agrupamento aritmético do milissegundo)
+                    chart_pivot = pd.pivot_table(
+                        chart_data,
+                        index="Eixo X",
+                        columns="MAC Address / ID",
+                        values="Grandeza Física",
+                        aggfunc="mean"
+                    )
+
+                    st.line_chart(chart_pivot, use_container_width=True, height=360)
+                else:
+                    st.info("📋 Base de dados desprovida de medições brutas no intervalo de amostragem requisitado.")
+
+            with col_metadata:
+                st.info(f"📋 **Estatística da Extração SQL:**\n\n{resp.result_metadata}\n\n**Escopo Analítico:**\n{janela_ctx} hora(s)")
+                st.caption(f"**Token de Assinatura (ID):** {resp.message_id}")
+                st.caption(f"**Geração do Report:** {datetime.datetime.fromtimestamp(resp.timestamp).strftime('%H:%M:%S')}")
         else:
-            st.error("A requisição OLAP foi rompida por perda de Framing ou Timeout do Kernel TCP.")
+            st.warning(f"⚠️ Restrição Computacional do Gateway: {resp.message}")
+    elif resp is not None:
+        st.error("A requisição OLAP foi rompida por perda de Framing ou Timeout do Kernel TCP.")
 
     # Informações sobre o processamento
     st.divider()
@@ -834,8 +897,9 @@ with tab4:
     if not st.session_state.device_history:
         st.info("Topologia desconhecida. Sincronize a rede na aba 'Fontes de Dados'.")
     else:
-        all_devices = st.session_state.device_history
-        device_lookup = {d.device_id: d for d in all_devices}
+        all_devices  = st.session_state.device_history
+        # [FIX QC-03] Indexação por device_id usando dicts.
+        device_lookup = {d["device_id"]: d for d in all_devices}
 
         c_dev, c_metric, c_time = st.columns([2, 2, 1])
 
@@ -847,7 +911,7 @@ with tab4:
             )
 
         selected_inspec_device = device_lookup[target_inspec_id]
-        available_metrics = DEVICE_METRICS_MAP.get(selected_inspec_device.type, ["state"])
+        available_metrics = DEVICE_METRICS_MAP.get(selected_inspec_device["type"], ["state"])
 
         with c_metric:
             metrica_inspec_alvo = st.selectbox(
@@ -865,30 +929,47 @@ with tab4:
                 key="tab4_slider",
             )
 
-        if st.button("Executar Varredura do Sensor", type="primary", use_container_width=True):
+        # [FIX QC-08] Consome resultado de inspeção enviado em background.
+        completed_inspec = consume_tcp_task("inspection_task", "Varredura do sensor")
+        if completed_inspec:
+            result, context = completed_inspec
+            st.session_state.inspection_result  = result.response
+            st.session_state.inspection_context = context
+            st.rerun()
+
+        if st.button("Executar Varredura do Sensor", type="primary", use_container_width=True,
+                     disabled=is_tcp_task_pending("inspection_task")):
             req = messages_pb2.ClientRequest()
-            req.type = messages_pb2.REQUEST_TYPE_ANALYTICS_QUERY
-            req.query_op = messages_pb2.OP_AVERAGE
-            req.query_metric = metrica_inspec_alvo
+            req.type            = messages_pb2.REQUEST_TYPE_ANALYTICS_QUERY
+            req.query_op        = messages_pb2.OP_AVERAGE
+            req.query_metric    = metrica_inspec_alvo
             req.target_device_id = target_inspec_id
-
             agora = int(time.time())
-            req.end_timestamp = agora
+            req.end_timestamp   = agora
             req.start_timestamp = agora - (janela_inspec * 3600)
+            submit_tcp_request("inspection_task", req, {
+                "target_id":    target_inspec_id,
+                "metrica":      metrica_inspec_alvo,
+                "janela":       janela_inspec,
+            })
+            st.session_state.inspection_result  = None
+            st.session_state.inspection_context = None
+            st.rerun()
 
-            with st.spinner(f"Filtrando matriz de dados para {target_inspec_id}..."):
-                resp = send_tcp_request(req)
-
-            if resp and resp.success:
+        # Renderiza resultado armazenado (persiste entre rerenders)
+        resp = st.session_state.inspection_result
+        ctx  = st.session_state.inspection_context
+        if resp and ctx:
+            if resp.success:
                 filtered_points = [
                     pt for pt in resp.graph_points
-                    if pt.device_id == target_inspec_id
+                    if pt.device_id == ctx["target_id"]
                 ]
 
                 if not filtered_points:
                     st.warning(
-                        f"Não há pontos de `{metrica_inspec_alvo}` emitidos por "
-                        f"`{target_inspec_id}` na janela solicitada."
+                        f"Não há pontos de `{ctx['metrica']}` emitidos por "
+                        f"`{ctx['target_id']}` na janela solicitada."
                     )
                 else:
                     df_inspec = pd.DataFrame([
@@ -905,7 +986,7 @@ with tab4:
                     )
 
                     st.divider()
-                    st.markdown(f"### Saúde Operacional: `{target_inspec_id}`")
+                    st.markdown(f"### Saúde Operacional: `{ctx['target_id']}`")
 
                     col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
                     col_kpi1.metric("Amostras Extraídas", len(df_inspec))
@@ -936,7 +1017,7 @@ with tab4:
                     col_graph, col_table = st.columns([2, 1])
 
                     with col_graph:
-                        st.write(f"#### Comportamento do Sinal: **{metrica_inspec_alvo}**")
+                        st.write(f"#### Comportamento do Sinal: **{ctx['metrica']}**")
                         df_inspec["Horário"] = pd.to_datetime(
                             df_inspec["timestamp"], unit="s"
                         ).dt.strftime("%H:%M:%S")
@@ -947,7 +1028,7 @@ with tab4:
                         )
 
                     with col_table:
-                        unit = METRIC_UNITS.get(metrica_inspec_alvo, "")
+                        unit = METRIC_UNITS.get(ctx["metrica"], "")
                         value_label = (
                             f"Medição ({unit})" if unit else "Medição"
                         )
@@ -959,8 +1040,7 @@ with tab4:
                             use_container_width=True,
                             hide_index=True,
                         )
-
             elif resp:
                 st.error(f"Falha na extração de dados do nó: {resp.message}")
-            else:
-                st.error("Ruptura de canal TCP ao solicitar vetor de telemetria isolado.")
+        elif resp is not None:
+            st.error("Ruptura de canal TCP ao solicitar vetor de telemetria isolado.")

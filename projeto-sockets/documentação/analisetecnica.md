@@ -19,7 +19,7 @@ Componentes principais:
 | Telemetria | UDP | 5000 | Exclusiva para `DataPayload` dos sensores para o gateway |
 | Cliente/Gateway | TCP | 5001 | Dashboard envia `ClientRequest` e recebe `ClientResponse` |
 | Descoberta/heartbeat | UDP | 5002 | Sensores enviam `DiscoveryResponse` ao gateway |
-| Controle Lua | TCP | 5002 | Gateway encaminha `ConfigCommand` para o sensor Lua |
+| Controle Lua | TCP | 5006 | Gateway encaminha `ConfigCommand` para o sensor Lua |
 | Controle Java | TCP | 5003 | Gateway encaminha `ConfigCommand` para o sensor Java |
 | Controle Python | TCP | 5004 | Gateway encaminha `ConfigCommand` para o sensor Python |
 | Recovery multicast | UDP | 5005 | Gateway envia `SMARTCITY_DISCOVERY_PROBE` para `239.0.0.1` |
