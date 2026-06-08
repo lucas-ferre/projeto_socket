@@ -21,7 +21,7 @@ local SECTORS = {
 }
 
 local CONTROL_TCP_PORT            = 5006
-local GATEWAY_HOST                = "gateway"
+local GATEWAY_HOST                = os.getenv("GATEWAY_HOST") or "gateway"
 local GATEWAY_TELEMETRY_PORT      = 5000
 local GATEWAY_UDP_DISCOVERY_PORT  = 5002
 local MULTICAST_GROUP             = "239.0.0.1"
@@ -40,6 +40,8 @@ local THRESHOLD_EVENT_COOLDOWN_SECS  = 3.0
 local LUMINOSITY_LOW_THRESHOLD    = tonumber(os.getenv("LUMINOSITY_LOW_THRESHOLD")    or "80")
 local POWER_CONSUMPTION_THRESHOLD = tonumber(os.getenv("POWER_CONSUMPTION_THRESHOLD") or "32")
 local DEVICE_COUNT                = tonumber(os.getenv("LUA_DEVICE_COUNT") or tostring(#SECTORS))
+local GATEWAY_DNS_CACHE_TTL_SECS  = math.max(1.0, tonumber(os.getenv("GATEWAY_DNS_CACHE_TTL_SECS") or "15") or 15.0)
+local GATEWAY_DNS_RETRY_SECS      = math.max(0.5, tonumber(os.getenv("GATEWAY_DNS_RETRY_SECS") or "1") or 1.0)
 
 -- [Melhoria 5] Timeout TCP configurável e menor (era 5.0s fixo)
 -- Reduz o tempo máximo que uma conexão lenta monopoliza o loop principal.
@@ -87,8 +89,8 @@ local DEFAULT_DEVICE_ID = device_order[1]
 -- ====================================================================
 
 print(string.format(
-    "[sensor_posto] | [Sensor Lua:DNS] Gateway '%s' será resolvido durante cada envio UDP.",
-    GATEWAY_HOST))
+    "[sensor_posto] | [Sensor Lua:DNS] Gateway '%s' será resolvido para IP antes do envio UDP (TTL %.0fs).",
+    GATEWAY_HOST, GATEWAY_DNS_CACHE_TTL_SECS))
 
 -- ====================================================================
 -- INICIALIZAÇÃO DE DESCRITORES DE REDE (SOCKETS POSIX BOUND)
@@ -152,6 +154,12 @@ end
 -- Filas globais (dependem das helpers acima)
 local udp_retry_queue    = new_queue()  -- reenvios UDP pendentes  [Melhoria 1]
 local pending_discoveries = new_queue() -- respostas de probe pendentes [Melhoria 4]
+local gateway_dns = {
+    ip            = nil,
+    expires_at    = 0,
+    next_retry_at = 0,
+    last_error    = nil
+}
 
 -- ====================================================================
 -- UTILITÁRIOS DE PROTOCOLO
@@ -172,6 +180,51 @@ end
 
 local function udp_error_text(err)
     return err and tostring(err) or "falha desconhecida"
+end
+
+local function resolve_gateway_ip(current_time, force_refresh)
+    current_time = current_time or socket.gettime()
+
+    if gateway_dns.ip
+       and not force_refresh
+       and current_time < gateway_dns.expires_at then
+        return gateway_dns.ip, nil
+    end
+
+    if not force_refresh
+       and current_time < gateway_dns.next_retry_at then
+        if gateway_dns.ip then
+            return gateway_dns.ip, nil
+        end
+        return nil, gateway_dns.last_error or "DNS do Gateway temporariamente indisponível"
+    end
+
+    local ip, err = socket.dns.toip(GATEWAY_HOST)
+    if ip then
+        if ip ~= gateway_dns.ip then
+            print(string.format(
+                "[sensor_posto] | [Sensor Lua:DNS] Gateway '%s' resolvido para %s.",
+                GATEWAY_HOST, ip))
+        end
+        gateway_dns.ip            = ip
+        gateway_dns.expires_at    = current_time + GATEWAY_DNS_CACHE_TTL_SECS
+        gateway_dns.next_retry_at = current_time
+        gateway_dns.last_error    = nil
+        return ip, nil
+    end
+
+    local err_msg = udp_error_text(err)
+    gateway_dns.last_error    = err_msg
+    gateway_dns.next_retry_at = current_time + GATEWAY_DNS_RETRY_SECS
+
+    if gateway_dns.ip then
+        print(string.format(
+            "[sensor_posto] | [Sensor Lua:DNS] Falha ao renovar DNS do Gateway '%s': %s. Usando IP cacheado %s.",
+            GATEWAY_HOST, err_msg, gateway_dns.ip))
+        return gateway_dns.ip, nil
+    end
+
+    return nil, err_msg
 end
 
 local function random_device_status()
@@ -197,9 +250,20 @@ end
 --   canais (TCP, multicast, telemetria periódica).
 -- ====================================================================
 
-local function send_udp_nonblocking(bytes, host, port, channel)
-    local ok, err = udp_out:sendto(bytes, host, port)
+local function send_udp_nonblocking(bytes, port, channel)
+    local gateway_ip, resolve_err = resolve_gateway_ip(socket.gettime(), false)
+    local ok, err
+
+    if gateway_ip then
+        ok, err = udp_out:sendto(bytes, gateway_ip, port)
+    else
+        ok, err = nil, resolve_err
+    end
+
     if ok then return true end
+    if gateway_ip then
+        gateway_dns.expires_at = 0
+    end
 
     err = udp_error_text(err)
     local delay = retry_delay(1)
@@ -207,7 +271,6 @@ local function send_udp_nonblocking(bytes, host, port, channel)
     if queue_size(udp_retry_queue) < UDP_RETRY_QUEUE_MAX then
         enqueue(udp_retry_queue, {
             bytes         = bytes,
-            host          = host,
             port          = port,
             channel       = channel,
             attempts      = 1,
@@ -236,12 +299,23 @@ local function process_udp_retry_queue(current_time)
         processed = processed + 1
         local attempt_number = entry.attempts + 1
 
-        local ok, err = udp_out:sendto(entry.bytes, entry.host, entry.port)
+        local gateway_ip, resolve_err = resolve_gateway_ip(current_time, false)
+        local ok, err
+
+        if gateway_ip then
+            ok, err = udp_out:sendto(entry.bytes, gateway_ip, entry.port)
+        else
+            ok, err = nil, resolve_err
+        end
+
         if ok then
             print(string.format(
                 "[sensor_posto] | [Sensor Lua:Retry] %s retransmitido com sucesso (tentativa %d/%d).",
                 entry.channel, attempt_number, UDP_MAX_RETRIES))
         else
+            if gateway_ip then
+                gateway_dns.expires_at = 0
+            end
             err = udp_error_text(err)
             if attempt_number >= UDP_MAX_RETRIES then
                 print(string.format(
@@ -323,7 +397,7 @@ local function send_discovery_response(target_device_id)
                 is_controllable = true
             }
             local bytes = assert(pb.encode("smartcity.DiscoveryResponse", msg))
-            local ok, err = send_udp_nonblocking(bytes, GATEWAY_HOST, GATEWAY_UDP_DISCOVERY_PORT, "Descoberta")
+            local ok, err = send_udp_nonblocking(bytes, GATEWAY_UDP_DISCOVERY_PORT, "Descoberta")
             if ok then
                 print(string.format(
                     "[Sensor Lua:Descoberta] Dispositivo=%s | Setor=%s | Status=%s | Porta=%d.",
@@ -379,7 +453,7 @@ local function send_metrics_payload(device, trigger_reason, metrics_override)
         metrics        = metrics
     }
     local bytes = assert(pb.encode("smartcity.DataPayload", payload))
-    local ok, err = send_udp_nonblocking(bytes, GATEWAY_HOST, GATEWAY_TELEMETRY_PORT, "Telemetria")
+    local ok, err = send_udp_nonblocking(bytes, GATEWAY_TELEMETRY_PORT, "Telemetria")
 
     if ok and device.status == "STATUS_ON" then
         local label = trigger_reason and "Evento por limiar" or "Telemetria injetada"
