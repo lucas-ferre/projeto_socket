@@ -137,13 +137,24 @@ def send_udp_message(message, port: int) -> None:
             return
         except OSError as exc:
             last_error = exc
+            # exc.strerror contém apenas o texto legível ("Name or service not known"),
+            # sem o prefixo "[Errno N]" que str(exc) inclui automaticamente.
+            err_msg = exc.strerror or str(exc)
+
             if attempt == MAX_UDP_SEND_ATTEMPTS - 1:
+                # Última tentativa — loga antes de encerrar para que a 3ª apareça
+                # no log junto com as anteriores, com contexto de esgotamento.
+                print(
+                    f"[sensor_camera] | [Sensor Python:Retry] Falha UDP porta {port} "
+                    f"(tentativa {attempt + 1}/{MAX_UDP_SEND_ATTEMPTS}): {err_msg}. "
+                    f"Todas as tentativas esgotadas."
+                )
                 break
 
             delay = retry_delay_secs(attempt)
             print(
-                f"[Sensor Python:Retry] Falha UDP porta {port} "
-                f"(tentativa {attempt + 1}/{MAX_UDP_SEND_ATTEMPTS}): {exc}. "
+                f"[sensor_camera] | [Sensor Python:Retry] Falha UDP porta {port} "
+                f"(tentativa {attempt + 1}/{MAX_UDP_SEND_ATTEMPTS}): {err_msg}. "
                 f"Retry em {delay:.2f}s."
             )
             shutdown_event.wait(delay)
@@ -183,7 +194,7 @@ def send_discovery_response(target_device_id: str | None = None) -> None:
                 f"Status={status_name(current_status)} | Handshake de presença injetado via porta {GATEWAY_DISCOVERY_PORT}."
             )
         except OSError as exc:
-            print(f"[sensor_camera] | [Sensor Python:Erro] Falha ao enviar descoberta de {device_id}: {exc}")
+            print(f"[sensor_camera] | [Sensor Python:Erro] Falha ao enviar descoberta de {device_id}: {exc.strerror or exc}")
 
 
 def build_traffic_metrics() -> list[messages_pb2.Metric]:
@@ -270,7 +281,7 @@ def emit_telemetry_payload(
                 f"Dispositivo={current_device_id} | Setor={sector} | Status={status_name(current_status)}"
             )
     except OSError as exc:
-        print(f"[sensor_camera] | [Sensor Python:Erro] Falha ao enviar telemetria de {current_device_id}: {exc}")
+        print(f"[sensor_camera] | [Sensor Python:Erro] Falha ao enviar telemetria de {current_device_id}: {exc.strerror or exc}")
 
 
 def send_telemetry_payload(device_id: str) -> None:

@@ -1,6 +1,7 @@
 import streamlit as st
 import socket
 import os
+import re
 import time
 import struct
 import uuid
@@ -30,6 +31,57 @@ _TCP_CONNECT_TIMEOUT = 2.0
 _TCP_IO_TIMEOUT = 5.0
 _MAX_TCP_FRAME_BYTES = 1024 * 1024
 _REQUEST_WORKERS = 4
+_OS_ERROR_CODE_RE = re.compile(r"\[(?:Errno|WinError)\s*-?\d+\]\s*|\bErrno\s*-?\d+\b:?\s*", re.IGNORECASE)
+_GATEWAY_UNAVAILABLE_CODES = {
+    "GATEWAY_DNS_ERROR",
+    "CONNECT_TIMEOUT",
+    "CONNECTION_REFUSED",
+    "CONNECTION_CLOSED",
+    "IO_TIMEOUT",
+    "SOCKET_ERROR",
+}
+
+
+def _clean_os_error_text(exc: BaseException) -> str:
+    message = ""
+    if isinstance(exc, OSError):
+        message = getattr(exc, "strerror", "") or ""
+        if not message and len(exc.args) > 1 and isinstance(exc.args[1], str):
+            message = exc.args[1]
+
+    if not message:
+        message = str(exc)
+
+    message = _OS_ERROR_CODE_RE.sub("", message).strip()
+    return message or exc.__class__.__name__
+
+
+def _format_transport_error(
+    result: "TcpRequestResult",
+    action: str,
+    *,
+    requires_gateway_db: bool = False,
+) -> str:
+    detail = result.error_message or "Falha de transporte sem detalhe adicional."
+
+    if result.error_code in _GATEWAY_UNAVAILABLE_CODES:
+        db_note = ""
+        if requires_gateway_db:
+            db_note = (
+                " As consultas dependem do banco de dados servido pelo Gateway, "
+                "então nenhum dado histórico pode ser recuperado enquanto ele estiver offline."
+            )
+
+        return (
+            f"Gateway indisponível na rede. Não foi possível {action}."
+            f"{db_note} Verifique se `{GATEWAY_HOST}:{GATEWAY_PORT}` está online e tente novamente. "
+            f"Detalhe técnico: {detail}"
+        )
+
+    if result.error_code:
+        return f"Não foi possível {action}. {result.error_code}: {detail}"
+
+    return f"Não foi possível {action}. {detail}"
 
 @dataclass
 class TcpRequestResult:
@@ -98,19 +150,31 @@ class GatewayTcpClient:
                 self.close()
                 return TcpRequestResult(
                     error_code="CONNECT_TIMEOUT",
-                    error_message="Timeout ao conectar ao Gateway.",
+                    error_message=f"Tempo limite ao abrir conexão TCP com {self.host}:{self.port}.",
+                )
+            except socket.gaierror as exc:
+                self.close()
+                return TcpRequestResult(
+                    error_code="GATEWAY_DNS_ERROR",
+                    error_message=(
+                        f"Não foi possível resolver o host '{self.host}'. "
+                        f"Detalhe: {_clean_os_error_text(exc)}."
+                    ),
                 )
             except ConnectionRefusedError:
                 self.close()
                 return TcpRequestResult(
                     error_code="CONNECTION_REFUSED",
-                    error_message="Gateway recusou a conexão TCP.",
+                    error_message=f"Conexão TCP recusada em {self.host}:{self.port}.",
                 )
             except OSError as exc:
                 self.close()
                 return TcpRequestResult(
                     error_code="SOCKET_ERROR",
-                    error_message=f"Falha de socket ao conectar ao Gateway: {exc}",
+                    error_message=(
+                        f"Falha de socket ao conectar a {self.host}:{self.port}. "
+                        f"Detalhe: {_clean_os_error_text(exc)}."
+                    ),
                 )
         finally:
             self._lock.release()
@@ -156,7 +220,10 @@ class GatewayTcpClient:
                         continue
                     return TcpRequestResult(
                         error_code="CONNECTION_CLOSED",
-                        error_message=f"Conexão TCP encerrada durante a requisição: {exc}",
+                        error_message=(
+                            "Conexão TCP encerrada durante a requisição. "
+                            f"Detalhe: {_clean_os_error_text(exc)}."
+                        ),
                     )
                 except socket.timeout:
                     self.close()
@@ -164,11 +231,20 @@ class GatewayTcpClient:
                         error_code="IO_TIMEOUT",
                         error_message="Gateway não respondeu dentro da janela de timeout do socket.",
                     )
+                except socket.gaierror as exc:
+                    self.close()
+                    return TcpRequestResult(
+                        error_code="GATEWAY_DNS_ERROR",
+                        error_message=(
+                            f"Não foi possível resolver o host '{self.host}'. "
+                            f"Detalhe: {_clean_os_error_text(exc)}."
+                        ),
+                    )
                 except ConnectionRefusedError:
                     self.close()
                     return TcpRequestResult(
                         error_code="CONNECTION_REFUSED",
-                        error_message="Gateway recusou a conexão TCP.",
+                        error_message=f"Conexão TCP recusada em {self.host}:{self.port}.",
                     )
                 except struct.error as exc:
                     self.close()
@@ -186,7 +262,7 @@ class GatewayTcpClient:
                     self.close()
                     return TcpRequestResult(
                         error_code="SOCKET_ERROR",
-                        error_message=f"Falha de socket no fluxo TCP: {exc}",
+                        error_message=f"Falha de socket no fluxo TCP: {_clean_os_error_text(exc)}.",
                     )
 
         return TcpRequestResult(
@@ -222,6 +298,15 @@ def is_tcp_task_pending(task_key: str) -> bool:
     return bool(task and not task["future"].done())
 
 
+def remember_gateway_transport_state(result: TcpRequestResult) -> None:
+    if result.response is not None:
+        st.session_state.gw_status = True
+        st.session_state.gw_last_check = time.time()
+    elif result.error_code in _GATEWAY_UNAVAILABLE_CODES:
+        st.session_state.gw_status = False
+        st.session_state.gw_last_check = time.time()
+
+
 def consume_tcp_task(task_key: str, label: str) -> tuple[TcpRequestResult, dict] | None:
     task = st.session_state.get(task_key)
     if not task:
@@ -236,6 +321,7 @@ def consume_tcp_task(task_key: str, label: str) -> tuple[TcpRequestResult, dict]
         return None
 
     result = future.result()
+    remember_gateway_transport_state(result)
     context = task["context"]
     del st.session_state[task_key]
     return result, context
@@ -252,7 +338,7 @@ def send_tcp_request(request: messages_pb2.ClientRequest) -> messages_pb2.Client
         return result.response
 
     if result.error_message:
-        st.error(f"{result.error_code}: {result.error_message}")
+        st.error(_format_transport_error(result, "enviar requisição ao Gateway"))
     return None
 
 
@@ -424,11 +510,15 @@ if 'olap_result' not in st.session_state:
     st.session_state.olap_result = None
 if 'olap_context' not in st.session_state:
     st.session_state.olap_context = None
+if 'olap_error' not in st.session_state:
+    st.session_state.olap_error = None
 # [FIX QC-08] Resultado da última inspeção individual (Aba 4)
 if 'inspection_result' not in st.session_state:
     st.session_state.inspection_result = None
 if 'inspection_context' not in st.session_state:
     st.session_state.inspection_context = None
+if 'inspection_error' not in st.session_state:
+    st.session_state.inspection_error = None
 
 # ====================================================================
 # SIDEBAR
@@ -486,7 +576,10 @@ with tab1:
         elif resp:
             st.session_state.last_list_msg = ("warning", f"⚠️ Alerta do Barramento: {resp.message}")
         else:
-            st.session_state.last_list_msg = ("error", f"❌ Link TCP inativo. {result.error_code}: {result.error_message}")
+            st.session_state.last_list_msg = (
+                "error",
+                f"❌ {_format_transport_error(result, 'sincronizar a topologia')}",
+            )
         st.rerun()
 
     # [FIX QC-01] col_refresh removida — era uma coluna vazia nunca utilizada.
@@ -667,7 +760,7 @@ with tab2:
                         })
                         st.session_state.last_cmd_result = {
                             "type": "error",
-                            "message": result.error_message,
+                            "message": _format_transport_error(result, "transmitir o comando TCP"),
                         }
 
                     st.rerun()
@@ -769,8 +862,17 @@ with tab3:
     completed_olap = consume_tcp_task("olap_task", "Query OLAP")
     if completed_olap:
         result, context = completed_olap
-        st.session_state.olap_result = result.response
         st.session_state.olap_context = context
+        if result.response is not None:
+            st.session_state.olap_result = result.response
+            st.session_state.olap_error = None
+        else:
+            st.session_state.olap_result = None
+            st.session_state.olap_error = _format_transport_error(
+                result,
+                "executar a consulta OLAP",
+                requires_gateway_db=True,
+            )
         st.rerun()
 
     if st.button("Disparar Query ao Gateway", type="primary", use_container_width=True,
@@ -788,12 +890,15 @@ with tab3:
             "janela_horas": janela_horas,
         })
         st.session_state.olap_result = None
+        st.session_state.olap_error = None
         st.rerun()
 
     # Renderiza resultado armazenado (persiste entre rerenders)
     resp = st.session_state.olap_result
     ctx  = st.session_state.olap_context
-    if resp and ctx:
+    if st.session_state.olap_error:
+        st.error(st.session_state.olap_error)
+    elif resp and ctx:
         op_ctx      = ctx["operacao"]
         metrica_ctx = ctx["metrica_alvo"]
         janela_ctx  = ctx["janela_horas"]
@@ -861,7 +966,11 @@ with tab3:
         else:
             st.warning(f"⚠️ Restrição Computacional do Gateway: {resp.message}")
     elif resp is not None:
-        st.error("A requisição OLAP foi rompida por perda de Framing ou Timeout do Kernel TCP.")
+        st.error(_format_transport_error(
+            TcpRequestResult(error_code="REQUEST_FAILED"),
+            "executar a consulta OLAP",
+            requires_gateway_db=True,
+        ))
 
     # Informações sobre o processamento
     st.divider()
@@ -933,8 +1042,17 @@ with tab4:
         completed_inspec = consume_tcp_task("inspection_task", "Varredura do sensor")
         if completed_inspec:
             result, context = completed_inspec
-            st.session_state.inspection_result  = result.response
             st.session_state.inspection_context = context
+            if result.response is not None:
+                st.session_state.inspection_result = result.response
+                st.session_state.inspection_error = None
+            else:
+                st.session_state.inspection_result = None
+                st.session_state.inspection_error = _format_transport_error(
+                    result,
+                    "executar a inspeção individual",
+                    requires_gateway_db=True,
+                )
             st.rerun()
 
         if st.button("Executar Varredura do Sensor", type="primary", use_container_width=True,
@@ -954,12 +1072,15 @@ with tab4:
             })
             st.session_state.inspection_result  = None
             st.session_state.inspection_context = None
+            st.session_state.inspection_error = None
             st.rerun()
 
         # Renderiza resultado armazenado (persiste entre rerenders)
         resp = st.session_state.inspection_result
         ctx  = st.session_state.inspection_context
-        if resp and ctx:
+        if st.session_state.inspection_error:
+            st.error(st.session_state.inspection_error)
+        elif resp and ctx:
             if resp.success:
                 filtered_points = [
                     pt for pt in resp.graph_points
@@ -1043,4 +1164,8 @@ with tab4:
             elif resp:
                 st.error(f"Falha na extração de dados do nó: {resp.message}")
         elif resp is not None:
-            st.error("Ruptura de canal TCP ao solicitar vetor de telemetria isolado.")
+            st.error(_format_transport_error(
+                TcpRequestResult(error_code="REQUEST_FAILED"),
+                "executar a inspeção individual",
+                requires_gateway_db=True,
+            ))
