@@ -43,19 +43,19 @@ local DEVICE_COUNT                = tonumber(os.getenv("LUA_DEVICE_COUNT") or to
 local GATEWAY_DNS_CACHE_TTL_SECS  = math.max(1.0, tonumber(os.getenv("GATEWAY_DNS_CACHE_TTL_SECS") or "15") or 15.0)
 local GATEWAY_DNS_RETRY_SECS      = math.max(0.5, tonumber(os.getenv("GATEWAY_DNS_RETRY_SECS") or "1") or 1.0)
 
--- [Melhoria 5] Timeout TCP configurável e menor (era 5.0s fixo)
+-- Timeout TCP configurável e menor (era 5.0s fixo)
 -- Reduz o tempo máximo que uma conexão lenta monopoliza o loop principal.
 local TCP_READ_TIMEOUT_SECS = math.max(0.5, tonumber(os.getenv("TCP_READ_TIMEOUT_SECS") or "2.0") or 2.0)
 
--- [Melhoria 1] Parâmetros da fila de retransmissão UDP não-bloqueante
+--  Parâmetros da fila de retransmissão UDP não-bloqueante
 local UDP_RETRY_QUEUE_MAX  = 32  -- descarta novos enfileiramentos quando lotada
 local UDP_RETRY_BATCH_SIZE = 4   -- tentativas de reenvio processadas por iteração
 
--- [Melhoria 2 / 3] Limites de drenagem por iteração
+-- Limites de drenagem por iteração
 local TCP_ACCEPT_BATCH_SIZE  = 4  -- conexões TCP aceitas por ciclo
 local MULTICAST_BATCH_SIZE   = 8  -- datagramas multicast lidos por ciclo
 
--- [Melhoria 4] Fila de respostas de descoberta pendentes
+-- Fila de respostas de descoberta pendentes
 local MAX_PENDING_DISCOVERIES = 10
 
 local devices      = {}
@@ -111,17 +111,6 @@ local tcp_server = assert(socket.bind("0.0.0.0", CONTROL_TCP_PORT))
 tcp_server:settimeout(0)
 print(string.format("[Sensor Lua:TCP] Interface de controle provisionada na porta %d.", CONTROL_TCP_PORT))
 
--- ====================================================================
--- [Melhoria 7] FILA FIFO O(1) — estrutura auxiliar compartilhada
---
--- table.remove(t, 1) é O(n): desloca todos os elementos a cada dequeue.
--- Esta implementação usa ponteiros head/tail sobre uma tabela esparsa,
--- garantindo enqueue e dequeue em O(1) amortizado.
---
--- Nota: os índices numéricos crescem indefinidamente, mas para as filas
--- usadas neste sensor (< 32 entradas simultâneas) o overhead é irrelevante.
--- ====================================================================
-
 local function new_queue()
     return { data = {}, head = 1, tail = 0 }
 end
@@ -152,8 +141,8 @@ local function queue_size(q)
 end
 
 -- Filas globais (dependem das helpers acima)
-local udp_retry_queue    = new_queue()  -- reenvios UDP pendentes  [Melhoria 1]
-local pending_discoveries = new_queue() -- respostas de probe pendentes [Melhoria 4]
+local udp_retry_queue    = new_queue()  -- reenvios UDP pendentes  
+local pending_discoveries = new_queue() -- respostas de probe pendentes 
 local gateway_dns = {
     ip            = nil,
     expires_at    = 0,
@@ -233,22 +222,6 @@ local function random_device_status()
     if roll <= 90 then return "STATUS_OFF" end
     return "STATUS_ERROR"
 end
-
--- ====================================================================
--- [Melhoria 1] ENVIO UDP NÃO-BLOQUEANTE com fila de retransmissão
---
--- PROBLEMA ORIGINAL:
---   send_udp_with_retry() chamava socket.sleep() entre tentativas,
---   congelando telemetria, heartbeat, comandos TCP e multicast enquanto
---   o gateway estava inacessível.
---
--- CORREÇÃO — fila de retransmissão (udp_retry_queue):
---   A primeira tentativa é feita imediatamente. Em caso de falha, o
---   pacote é enfileirado com o timestamp da próxima tentativa. A função
---   retorna sem bloquear. process_udp_retry_queue() drena a fila no
---   início de cada iteração do loop principal, sem afetar os demais
---   canais (TCP, multicast, telemetria periódica).
--- ====================================================================
 
 local function send_udp_nonblocking(bytes, port, channel)
     local gateway_ip, resolve_err = resolve_gateway_ip(socket.gettime(), false)
@@ -493,25 +466,10 @@ local function poll_threshold_events(current_time)
     end
 end
 
--- ====================================================================
--- [Melhoria 2] Processamento de múltiplas conexões TCP por ciclo
---
--- PROBLEMA ORIGINAL:
---   Uma única tcp_server:accept() por iteração deixava conexões
---   acumulando no backlog durante ciclos de processamento longos.
---
--- CORREÇÃO:
---   handle_control_command() foi extraída como função independente.
---   poll_control_commands() drena o backlog em loop (até TCP_ACCEPT_BATCH_SIZE
---   conexões por ciclo) — sem socket.sleep, pois accept() retorna nil
---   imediatamente quando não há conexões pendentes (timeout=0).
--- ====================================================================
-
 local function handle_control_command(client)
     local peer_ip, peer_port = client:getpeername()
     print(string.format("[Sensor Lua:TCP] Conexão estabelecida com %s:%s", peer_ip, peer_port))
 
-    -- [Melhoria 5] Timeout reduzido: clientes lentos não monopolizam o loop
     client:settimeout(TCP_READ_TIMEOUT_SECS)
 
     local header_data, header_err = recv_exact(client, 4)
@@ -595,27 +553,6 @@ local function poll_control_commands()
     end
 end
 
--- ====================================================================
--- [Melhorias 3 e 4] Drenagem completa de probes multicast + fila múltipla
---
--- PROBLEMA ORIGINAL — Melhoria 3:
---   Uma única udp_mc:receivefrom() por ciclo deixava pacotes acumulando
---   no buffer do kernel. Sob rajadas de probes, o backlog crescia
---   indefinidamente entre iterações.
---
--- PROBLEMA ORIGINAL — Melhoria 4:
---   Um único probe_pending_until descartava silenciosamente os probes B
---   e C se chegassem enquanto A estava pendente. Em vez de múltiplas
---   respostas escalonadas no tempo, apenas uma era emitida.
---
--- CORREÇÃO:
---   pending_discoveries é uma fila FIFO de entradas { fire_at }.
---   Cada probe recebido enquanto a fila não estiver saturada gera
---   uma nova entrada com jitter independente. A drenagem do socket
---   multicast é feita em loop (até MULTICAST_BATCH_SIZE por ciclo).
---   Entradas prontas (fire_at <= current_time) são disparadas em ordem.
--- ====================================================================
-
 local function poll_multicast_probes(current_time)
     -- Passo A: disparar descobertas cujo jitter expirou
     while not queue_empty(pending_discoveries) do
@@ -687,7 +624,7 @@ while keep_running do
     poll_threshold_events(current_time)
 
     -- 3. Heartbeat topológico
-    -- [Melhoria 6] next_heartbeat_at avança a partir do tempo AGENDADO,
+    -- next_heartbeat_at avança a partir do tempo AGENDADO,
     -- não do tempo atual — elimina drift acumulativo entre disparos.
     if current_time >= next_heartbeat_at then
         print("[Sensor Lua:Heartbeat] Renovando presença via DiscoveryResponse.")

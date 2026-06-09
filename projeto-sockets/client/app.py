@@ -24,7 +24,7 @@ import messages_pb2 # pyright: ignore[reportMissingImports]
 GATEWAY_HOST = os.getenv("GATEWAY_HOST", "gateway")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "5001"))
 
-# [B2/M1] TTL do cache de status do gateway (segundos)
+# TTL do cache de status do gateway (segundos)
 # Evita probe TCP bloqueante a cada rerender do Streamlit.
 _GW_STATUS_TTL = 10.0
 _TCP_CONNECT_TIMEOUT = 2.0
@@ -343,7 +343,7 @@ def send_tcp_request(request: messages_pb2.ClientRequest) -> messages_pb2.Client
 
 
 def _device_to_dict(d) -> dict:
-    """[FIX QC-03] Converte DeviceInfo protobuf para dict Python simples.
+    """ Converte DeviceInfo protobuf para dict Python simples.
     Armazenar dicts em session_state evita mutação de objetos protobuf e elimina
     dependência de ciclo de vida do GC sobre mensagens filho de `resp`.
     """
@@ -374,7 +374,7 @@ def infer_sector_from_device_id(device_id: str) -> str:
         "porangabussu": "Porangabussu",
     }
     
-    # FIX 2: Busca relaxada para não quebrar com nomes como "CameraPici01"
+    # Busca relaxada para não quebrar com nomes como "CameraPici01"
     for slug, label in sector_map.items():
         if slug in device_id.lower():
             return label
@@ -485,8 +485,6 @@ st.markdown("Monitoramento distribuído, controle operacional e agregação esta
 
 # ====================================================================
 # GERENCIAMENTO DE ESTADO EM MEMÓRIA
-# [B2/M1] Movido para ANTES da sidebar — garante que gw_last_check e
-# gw_status existam quando a sidebar tentar lê-los no primeiro render.
 # ====================================================================
 
 if 'device_history' not in st.session_state:
@@ -497,22 +495,22 @@ if 'last_cmd_result' not in st.session_state:
     st.session_state.last_cmd_result = None
 if 'selected_device_id' not in st.session_state:
     st.session_state.selected_device_id = None
-# [B2/M1] Cache de status do gateway com TTL
+# Cache de status do gateway com TTL
 if 'gw_last_check' not in st.session_state:
     st.session_state.gw_last_check = 0.0
 if 'gw_status' not in st.session_state:
     st.session_state.gw_status = False
-# [FIX QC-08] Mensagem da última sincronização de topologia (Aba 1)
+#  Mensagem da última sincronização de topologia (Aba 1)
 if 'last_list_msg' not in st.session_state:
     st.session_state.last_list_msg = None
-# [FIX QC-08] Resultado da última query OLAP (Aba 3)
+#  Resultado da última query OLAP (Aba 3)
 if 'olap_result' not in st.session_state:
     st.session_state.olap_result = None
 if 'olap_context' not in st.session_state:
     st.session_state.olap_context = None
 if 'olap_error' not in st.session_state:
     st.session_state.olap_error = None
-# [FIX QC-08] Resultado da última inspeção individual (Aba 4)
+#  Resultado da última inspeção individual (Aba 4)
 if 'inspection_result' not in st.session_state:
     st.session_state.inspection_result = None
 if 'inspection_context' not in st.session_state:
@@ -528,9 +526,7 @@ with st.sidebar:
     st.subheader("📊 Status do Sistema")
     col1, col2, col3 = st.columns(3)
 
-    # [B2/M1] Probe TCP só executado quando o cache expirar (TTL = 10s).
-    # Antes: check_gateway_status() abria um socket a cada rerender —
-    # qualquer slider/aba bloqueava a UI por até 2s com gateway down.
+    # Probe TCP só executado quando o cache expirar (TTL = 10s).
     if time.time() - st.session_state.gw_last_check > _GW_STATUS_TTL:
         st.session_state.gw_status = check_gateway_status()
         st.session_state.gw_last_check = time.time()
@@ -559,14 +555,14 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab1:
     st.subheader("📡 Nós Operacionais Registrados no Gateway")
 
-    # [FIX QC-08] Consome resultado de sincronização enviada em background.
+    # Consome resultado de sincronização enviada em background.
     # O padrão submit→rerun→consume mantém a UI responsiva durante o I/O TCP.
     completed_list = consume_tcp_task("list_devices_task", "Sincronização de topologia")
     if completed_list:
         result, _ = completed_list
         resp = result.response
         if resp and resp.success:
-            # [FIX QC-03] Armazena como dicts Python — elimina mutação de objetos
+            # Armazena como dicts Python — elimina mutação de objetos
             # protobuf e dependência do ciclo de vida de `resp` no GC.
             st.session_state.device_history = [_device_to_dict(d) for d in resp.devices]
             if not resp.devices:
@@ -582,8 +578,6 @@ with tab1:
             )
         st.rerun()
 
-    # [FIX QC-01] col_refresh removida — era uma coluna vazia nunca utilizada.
-    # use_container_width=True já garante botão com largura total.
     if st.button("Atualizar Topologia de Rede", type="primary", use_container_width=True,
                  disabled=is_tcp_task_pending("list_devices_task")):
         req = messages_pb2.ClientRequest()
@@ -592,7 +586,6 @@ with tab1:
         st.session_state.last_list_msg = None
         st.rerun()
 
-    # Exibe feedback da última operação
     if st.session_state.last_list_msg:
         kind, msg = st.session_state.last_list_msg
         {"success": st.success, "warning": st.warning,
@@ -601,7 +594,7 @@ with tab1:
     if st.session_state.device_history:
         device_data = []
         for d in st.session_state.device_history:
-            # [FIX QC-03] Acesso via dict — os dados são agora dicts Python simples.
+            #  Acesso via dict — os dados são agora dicts Python simples.
             device_data.append({
                 "ID": d["device_id"],
                 "Setor Geográfico": infer_sector_from_device_id(d["device_id"]),
@@ -661,7 +654,6 @@ with tab2:
                 if st.session_state.selected_device_id not in device_ids and device_ids:
                     st.session_state.selected_device_id = device_ids[0]
                 
-                # [R7] Parâmetro index= removido — conflitava silenciosamente com key=.
                 target_id = st.selectbox(
                     "Selecione o Nó Alvo de Atuação", 
                     options=device_ids,
@@ -694,7 +686,6 @@ with tab2:
                         if st.button("✕", key="clear_msg"):
                             st.session_state.last_cmd_result = None
                 
-                # FIX 3: Estrutura completamente reativa. st.form foi removido.
                 st.write(f"### Parâmetros de Intervenção: `{target_id}`")
                 
                 c1, c2 = st.columns(2)
@@ -737,9 +728,7 @@ with tab2:
                         })
 
                         if resp.success:
-                            # [FIX QC-03] Mutação sobre dict Python — segura e explícita.
-                            # Antes mutava campos de objeto protobuf armazenado em session_state,
-                            # o que é dependente de implementação e não thread-safe.
+
                             for device in st.session_state.device_history:
                                 if device["device_id"] == context["target_id"]:
                                     if context["update_status"]:
@@ -765,7 +754,6 @@ with tab2:
 
                     st.rerun()
 
-                # Submissão direta e avaliação reativa dos valores correntes no dashboard
                 command_pending = is_tcp_task_pending("command_task")
                 if st.button(
                     "Transmitir Payload de Controle (TCP)",
@@ -858,7 +846,6 @@ with tab3:
     with c_time:
         janela_horas = st.slider("Fatia Temporal Histórica (Horas passadas)", min_value=1, max_value=24, value=1)
 
-    # [FIX QC-08] Consome resultado OLAP enviado em background.
     completed_olap = consume_tcp_task("olap_task", "Query OLAP")
     if completed_olap:
         result, context = completed_olap
@@ -933,7 +920,7 @@ with tab3:
                     else:
                         st.error(f"**🔴 Crítico: Integridade térmica/física comprometida.**\n\n{ref_range.get('description', '')}")
 
-                # FIX 4: Desenho da Linha Temporal Nativa (Isolado de sessões fantasma)
+                # Desenho da Linha Temporal Nativa (Isolado de sessões fantasma)
                 st.subheader(f"📈 Extração do Histórico Contínuo ({janela_ctx}h)")
 
                 if len(resp.graph_points) > 0:
@@ -1007,7 +994,7 @@ with tab4:
         st.info("Topologia desconhecida. Sincronize a rede na aba 'Fontes de Dados'.")
     else:
         all_devices  = st.session_state.device_history
-        # [FIX QC-03] Indexação por device_id usando dicts.
+        # Indexação por device_id usando dicts.
         device_lookup = {d["device_id"]: d for d in all_devices}
 
         c_dev, c_metric, c_time = st.columns([2, 2, 1])
@@ -1038,7 +1025,7 @@ with tab4:
                 key="tab4_slider",
             )
 
-        # [FIX QC-08] Consome resultado de inspeção enviado em background.
+        # Consome resultado de inspeção enviado em background.
         completed_inspec = consume_tcp_task("inspection_task", "Varredura do sensor")
         if completed_inspec:
             result, context = completed_inspec

@@ -58,35 +58,9 @@ const char *global_device_sectors [DEVICE_COUNT_MAX];
 Smartcity__DeviceStatus global_device_statuses[DEVICE_COUNT_MAX];
 pthread_mutex_t statuses_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/*
- * [Fix 1] global_last_threshold_send — acessado EXCLUSIVAMENTE pelo main thread:
- *   · poll_threshold_events()  → chamada via sleep_with_threshold_scans()
- *   · loop de telemetria       → imediatamente após a escrita de status
- * A thread multicast só chama send_discovery_announcement(), que não toca este
- * array. Mutex seria correto se outras threads escrevessem aqui; como não escrevem,
- * o acesso é thread-safe por design de chamada. O comentário torna esse contrato
- * explícito para futuros mantenedores.
- */
+
 double global_last_threshold_send[DEVICE_COUNT_MAX];  /* single-threaded: main apenas */
 
-/*
- * [Fix 2] global_seq_counter como atomic_uint.
- *
- * Problema original: declarado como plain 'unsigned int', mas <stdatomic.h> estava
- * importado sem uso — sinalizando intenção atômica não implementada. A operação
- * seq_counter++ é um read-modify-write não atômico: em plataformas onde o compilador
- * gera load + add + store separados, uma segunda thread que fizesse o mesmo poderia
- * produzir duplicatas de sequence ID.
- *
- * Embora send_environment_payload() seja chamado apenas do main thread hoje,
- * usar atomic_uint:
- *   · elimina o UB caso o padrão de chamadas mude;
- *   · honra o contrato implícito do #include <stdatomic.h>;
- *   · é custo zero em x86/ARM (uma instrução lock xadd).
- *
- * memory_order_relaxed é suficiente: o counter só precisa ser único e crescente —
- * não é uma barreira de memória para outros dados.
- */
 atomic_uint global_seq_counter;   /* inicializado em main() via atomic_init() */
 
 static const char *SENSOR_SECTORS[]      = { "Pici", "Benfica", "Porangabussu" };
@@ -95,23 +69,6 @@ static const int   SENSOR_SECTOR_COUNT   = 3;
 static const char *METRIC_NAMES[] = { "temperature", "humidity", "co2",   "pm25",   "pm10",   "aqi"   };
 static const char *METRIC_UNITS[] = {          "C",       "%",   "ppm", "ug/m3", "ug/m3", "index" };
 
-/*
- * [Fix 3] g_self_hostname como variável global, inicializada em main() antes de
- * pthread_create().
- *
- * Problema original: self_hostname era uma variável static local dentro de
- * send_discovery_announcement(). A inicialização lazy (if hostname[0] == '\0')
- * funcionava corretamente porque a primeira chamada ocorre em main() ANTES de
- * pthread_create() — mas dependia silenciosamente dessa ordem de execução.
- * Se alguém mover ou reordenar as chamadas, a thread multicast e o main thread
- * poderiam tentar inicializar simultaneamente via gethostname(), que é uma
- * race condition em memória compartilhada (UB em C11).
- *
- * Solução: inicializar explicitamente em main() antes de criar qualquer thread.
- * O hostname é lido (nunca mais escrito) pelas demais funções — acesso thread-safe
- * por ser read-only após a inicialização, com a barreira de memória do pthread_create()
- * garantindo visibilidade para a thread filha.
- */
 char g_self_hostname[256];   /* inicializado em main() antes de pthread_create() */
 
 // ====================================================================
@@ -308,13 +265,6 @@ static int send_environment_payload(int device_idx,
     char msg_id_buffer[80];
     time_t now = time(NULL);
 
-    /*
-     * [Fix 2] atomic_fetch_add_explicit com memory_order_relaxed:
-     *   · retorna o valor ANTES do incremento (equivalente a seq_counter++)
-     *   · a operação é indivisível — sem load + add + store separados
-     *   · relaxed é suficiente: o counter só precisa de unicidade global,
-     *     não de ordenação de memória em relação a outros dados
-     */
     unsigned int seq = atomic_fetch_add_explicit(&global_seq_counter, 1,
                                                  memory_order_relaxed);
     snprintf(msg_id_buffer, sizeof(msg_id_buffer),
@@ -379,8 +329,7 @@ static int send_environment_payload(int device_idx,
 static void poll_threshold_events(void) {
     double now_mono = monotonic_seconds();
 
-    /* global_last_threshold_send: acesso sem mutex — single-threaded (main apenas).
-     * Ver comentário na declaração da variável. */
+    /* global_last_threshold_send: acesso sem mutex — single-threaded (main apenas). */
     for (int device_idx = 0; device_idx < device_count; device_idx++) {
         pthread_mutex_lock(&statuses_mutex);
         int is_on = (global_device_statuses[device_idx] == SMARTCITY__DEVICE_STATUS__STATUS_ON);
@@ -460,17 +409,6 @@ void send_discovery_announcement(void) {
         return;
     }
 
-    /*
-     * [Fix 3] g_self_hostname é uma variável global inicializada em main() ANTES
-     * de pthread_create(). Leitura read-only daqui em diante — thread-safe por
-     * definição (sem writer concorrente após a inicialização).
-     *
-     * Problema resolvido: a versão anterior usava 'static char self_hostname[256]'
-     * dentro desta função com inicialização lazy (if hostname[0] == '\0'). Isso
-     * funcionava somente porque a primeira chamada ocorria antes de pthread_create().
-     * Qualquer refatoração que invertesse essa ordem criaria uma race condition entre
-     * main e multicast_listener_thread na escrita concorrente do buffer estático.
-     */
     for (int i = 0; i < device_count; i++) {
         char disc_msg_id[80];
         time_t disc_now = time(NULL);
@@ -596,17 +534,8 @@ void *multicast_listener_thread(void *arg) {
 int main(void) {
     srand((unsigned int)(time(NULL) ^ getpid()));
 
-    /*
-     * [Fix 2] Inicialização explícita do contador atômico de sequência.
-     * atomic_init() é necessário antes de qualquer atomic_fetch_add_explicit().
-     */
     atomic_init(&global_seq_counter, 0);
 
-    /*
-     * [Fix 3] Inicialização do hostname ANTES de qualquer pthread_create().
-     * g_self_hostname é read-only a partir daqui — todos os acessos posteriores
-     * (inclusive da thread multicast) são thread-safe por definição.
-     */
     if (gethostname(g_self_hostname, sizeof(g_self_hostname)) != 0) {
         strncpy(g_self_hostname, "sensor_clima", sizeof(g_self_hostname) - 1);
         g_self_hostname[sizeof(g_self_hostname) - 1] = '\0';

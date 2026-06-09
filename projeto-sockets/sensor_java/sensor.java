@@ -265,7 +265,7 @@ public class sensor {
         DeviceState device = DEVICES.get(deviceId);
         if (device == null) return;
 
-        // [M4] Reutiliza DISC_SOCKET estático — sem criação/destruição de socket por chamada
+        // Reutiliza DISC_SOCKET estático — sem criação/destruição de socket por chamada
         try {
             Messages.DiscoveryResponse disc = Messages.DiscoveryResponse.newBuilder()
                 .setMessageId("DISC-" + device.deviceId + "-" + System.currentTimeMillis())
@@ -388,7 +388,7 @@ public class sensor {
                     out.write(respBuf);
                     sendDiscovery(target.deviceId);
                 } catch (Exception e) {
-                    // [Fix 2] SocketException("interrupted") é a forma como operações de socket
+                    // SocketException("interrupted") é a forma como operações de socket
                     // sinalizam interrupção do thread — não é identificável como InterruptedException.
                     // Verificar o flag antes de logar e continuar o loop de conexões.
                     if (Thread.currentThread().isInterrupted()) {
@@ -400,7 +400,7 @@ public class sensor {
                 }
             }
         } catch (Exception e) {
-            // [Fix 2] Interrupção durante ServerSocket.accept() ou na criação do servidor.
+            // Interrupção durante ServerSocket.accept() ou na criação do servidor.
             if (Thread.currentThread().isInterrupted()) {
                 Thread.currentThread().interrupt();
                 return;
@@ -445,7 +445,7 @@ public class sensor {
                 }
             }
         } catch (Exception e) {
-            // [Fix 2] mc.receive() lança SocketException (não InterruptedException) quando o
+            // mc.receive() lança SocketException (não InterruptedException) quando o
             // thread é interrompido. Restaurar o flag e sair limpo em vez de printar stacktrace.
             if (Thread.currentThread().isInterrupted()) {
                 Thread.currentThread().interrupt();
@@ -565,13 +565,13 @@ public class sensor {
                 Thread.sleep(200L);
             }
         } catch (InterruptedException ie) {
-            // [Fix 2] Thread.sleep(200L) lança InterruptedException quando o thread é
+            // Thread.sleep(200L) lança InterruptedException quando o thread é
             // interrompido. Capturar separadamente de Exception para restaurar o flag
             // e encerrar o loop limpo, sem printar stacktrace.
             Thread.currentThread().interrupt();
             System.out.println("[Java:UDP] Thread de telemetria interrompida — encerrando loop.");
         } catch (Exception e) {
-            // [Fix 2] Verificar interrupção também aqui: operações de socket podem lançar
+            // Verificar interrupção também aqui: operações de socket podem lançar
             // SocketException("interrupted") em vez de InterruptedException.
             if (Thread.currentThread().isInterrupted()) {
                 Thread.currentThread().interrupt();

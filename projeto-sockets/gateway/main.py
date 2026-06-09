@@ -45,7 +45,7 @@ DB_FILE            = os.path.join(DB_DIR, "smartcity_gateway.db")
 DB_POOL_SIZE       = max(1, int(os.getenv("DB_POOL_SIZE", "4")))
 DB_BUSY_TIMEOUT_MS = 10000
 
-# [M3] Intervalo do WAL checkpoint em segundos (padrão 5 min, mínimo 60 s)
+# Intervalo do WAL checkpoint em segundos (padrão 5 min, mínimo 60 s)
 WAL_CHECKPOINT_INTERVAL_SECS = max(60.0, float(os.getenv("WAL_CHECKPOINT_INTERVAL_SECS", "300")))
 
 # [OLAP] Gestão de volume e aceleração de consultas
@@ -81,7 +81,7 @@ TELEMETRY_QUEUE: asyncio.Queue | None = None
 # Usa OrderedDict com evicção LRU (máx 1000 entradas) para evitar memory leak
 LAST_MESSAGE_INFO = collections.OrderedDict()
 
-# [FIX BUG-01] Referências fortes para tasks UDP criadas via asyncio.create_task.
+# Referências fortes para tasks UDP criadas via asyncio.create_task.
 # O event loop mantém apenas referências fracas; sem este set, o GC pode coletar
 # a task antes de ela concluir, descartando telemetria/descoberta silenciosamente.
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
@@ -97,7 +97,7 @@ UDP_TELEMETRY_PORT = 5000   # Porta dedicada exclusivamente à ingestão de dado
 UDP_DISCOVERY_PORT = 5002   # Porta dedicada exclusivamente aos handshakes de topologia
 TCP_PORT           = 5001
 
-# [B5] Timeout para leitura de cabeçalho e payload TCP do cliente (configurável)
+# Timeout para leitura de cabeçalho e payload TCP do cliente (configurável)
 TCP_CLIENT_READ_TIMEOUT = max(5.0, float(os.getenv("TCP_CLIENT_READ_TIMEOUT", "10")))
 TCP_CLIENT_IDLE_TIMEOUT = max(
     TCP_CLIENT_READ_TIMEOUT,
@@ -170,8 +170,7 @@ class SQLiteConnectionPool:
         try:
             yield db
         except Exception:
-            # [FIX A] Rollback encapsulado para não substituir a exceção original
-            # caso ele próprio falhe (ex.: conexão já fechada).
+           
             try:
                 await db.rollback()
             except Exception as rollback_exc:
@@ -206,8 +205,7 @@ def get_telemetry_queue() -> asyncio.Queue:
 
 def ensure_metrics_index(cursor: sqlite3.Cursor):
     """Garante índices compatíveis com ingestão, retenção e consultas OLAP."""
-    # [FIX QC-04] DROP INDEX removido — causava janela sem índice a cada restart.
-    # CREATE INDEX IF NOT EXISTS é idempotente e seguro.
+
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_metrics_metric_time_device
         ON metrics (metric_name, timestamp, device_id)
@@ -296,8 +294,6 @@ def init_db():
             last_seen    INTEGER
         )
     """)
-    # [FIX QC-07] Índice em last_seen: usado em device_offline_monitor_loop
-    # (UPDATE ... WHERE last_seen < ? AND status != ?), evita full-scan da tabela.
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_devices_last_seen
         ON devices (last_seen)
@@ -393,7 +389,7 @@ async def persist_telemetry_batch(batch: list[TelemetryEnvelope]):
 
     now = int(time.time())
     device_updates = {
-        # [FIX INC-03] control_port=0 incluído explicitamente para evitar NULL quando
+        # control_port=0 incluído explicitamente para evitar NULL quando
         # a telemetria chega antes da mensagem de descoberta (race condition de rede).
         # INSERT OR IGNORE garante que uma descoberta posterior sobrescreva via
         # process_discovery (ON CONFLICT DO UPDATE com o valor real da porta).
@@ -508,10 +504,6 @@ async def process_discovery(disc: messages_pb2.DiscoveryResponse, ip: str):
     """Registra ou renova a presença de nós operacionais assincronamente."""
     now = int(time.time())
 
-    # [FIX INC-01] O campo ip_address do DiscoveryResponse agora é lido e utilizado.
-    # Estratégia: priorizar o hostname/IP anunciado pelo sensor (disc.ip_address) —
-    # em Docker, é um hostname DNS válido (e.g. "sensor_posto", "sensor_camera").
-    # Fallback para o IP de origem UDP quando o campo não for preenchido pelo sensor.
     announced = disc.ip_address.strip() if disc.ip_address else ""
     effective_ip = announced if announced else ip
 
@@ -588,13 +580,13 @@ class TelemetryUDPProtocol(asyncio.DatagramProtocol):
                         return
 
                 # Evicção LRU: manter máximo de 1000 entradas em LAST_MESSAGE_INFO
-                # [FIX QC-05] `while` em vez de `if` — garante que o dict nunca
+                # `while` em vez de `if` — garante que o dict nunca
                 # ultrapasse 1000 entradas mesmo em inserções simultâneas.
                 while len(LAST_MESSAGE_INFO) >= 1000:
                     LAST_MESSAGE_INFO.popitem(last=False)
                 
                 LAST_MESSAGE_INFO[payload.device_id] = (payload.timestamp, payload.message_id)
-                # [FIX BUG-01] Guarda referência forte para evitar coleta pelo GC
+                # Guarda referência forte para evitar coleta pelo GC
                 # antes da task completar (event loop mantém apenas refs fracas).
                 task = asyncio.create_task(process_telemetry(payload, addr[0]))
                 _BACKGROUND_TASKS.add(task)
@@ -686,7 +678,7 @@ async def device_offline_monitor_loop():
     while True:
         try:
             cutoff = int(time.time() - DEVICE_OFFLINE_TIMEOUT_SECS)
-            # [FIX B] rowcount capturado dentro do bloco async with, enquanto a
+            # rowcount capturado dentro do bloco async with, enquanto a
             # conexão ainda está checada para uso. Acessá-lo após o bloco é frágil
             # pois a conexão pode ser reutilizada por outra corrotina.
             marked_offline = 0
@@ -815,8 +807,7 @@ async def fetch_graph_rows(
     end_timestamp: int,
     target_device_id: str = "",
 ) -> list[tuple[int, float, str]]:
-    # [FIX D] Query construída dinamicamente: elimina 4 branches quase idênticos
-    # (is_rollup × has_target_device_id). Comportamento idêntico ao original.
+    # Query construída dinamicamente com base em (is_rollup × target_device_id).
     query_start, query_end = olap_time_range(source, start_timestamp, end_timestamp)
 
     params: list = [metric_name, query_start, query_end]
@@ -854,8 +845,7 @@ async def execute_olap_from_source(
     req: messages_pb2.ClientRequest,
     source: OlapSource,
 ) -> OlapQueryResult:
-    # [FIX E] Queries construídas dinamicamente com base em (is_rollup × target_device_id).
-    # Elimina 8 branches quase idênticos; comportamento idêntico ao original.
+    # Queries construídas dinamicamente com base em (is_rollup × target_device_id).
     query_start, query_end = olap_time_range(source, req.start_timestamp, req.end_timestamp)
 
     # Fragmentos que diferem entre rollup e raw
@@ -1195,7 +1185,7 @@ async def handle_client_request(reader: asyncio.StreamReader, writer: asyncio.St
                 resp = new_client_response(success=False)
                 resp.message = f"Falha SQLite no Gateway: {exc}"
             except Exception as exc:
-                # [FIX C] Captura exceções inesperadas (ex.: AttributeError, TypeError)
+                # Captura exceções inesperadas (ex.: AttributeError, TypeError)
                 # que escapariam para o handler de conexão e encerrariam o canal TCP
                 # sem enviar resposta ao cliente.
                 log.error(
@@ -1270,7 +1260,7 @@ async def main():
         async with server:
             await server.serve_forever()
     finally:
-        # [FIX F] Cancela tasks UDP em voo (telemetria/descoberta) antes de fechar
+        # Cancela tasks UDP em voo (telemetria/descoberta) antes de fechar
         # os transportes e o pool. Sem isso, tasks que chegaram no último instante
         # podem tentar acessar o pool já encerrado.
         for task in list(_BACKGROUND_TASKS):

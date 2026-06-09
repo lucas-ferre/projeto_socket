@@ -32,13 +32,13 @@ O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclu
 │                                                                    │
 │  ┌──────────────────┐   UDP :5000 (Telemetria)                    │
 │  │  sensor_clima    │──────────────────────────────┐              │
-│  │  C · 3 Estações  │   UDP :5002 (Descoberta)     │              │
+│  │  C · 6 Estações  │   UDP :5002 (Descoberta)     │              │
 │  │  Pici/Benf/Poran.│──────────────────────────────┤              │
 │  └──────────────────┘                              ▼              │
 │                                          ┌──────────────────────┐ │
 │  ┌──────────────────┐   UDP :5000 ──────▶│      gateway         │ │
 │  │  sensor_posto    │   UDP :5002 ──────▶│  Python / asyncio    │ │
-│  │  Lua · 3 Postes  │◀── TCP :5002 ──────│                      │ │
+│  │  Lua · 3 Postes  │◀── TCP :5006 ──────│                      │ │
 │  └──────────────────┘                    │  SQLite WAL          │ │
 │                                          │  Pool aiosqlite      │ │
 │  ┌──────────────────┐   UDP :5000 ──────▶│  Framing TCP         │ │
@@ -78,8 +78,8 @@ O sistema segue o modelo **Hub-and-Spoke**: todos os sensores se comunicam exclu
 | Gateway | Python 3.11 | asyncio | `aiosqlite`, `protobuf` |
 | Dashboard | Python 3.11 | Streamlit | `protobuf`, `pandas` |
 | Sensor Clima | C (C11) | POSIX/pthreads | `protobuf-c` |
-| Sensor Poste | Lua 5.4 | LuaSocket | `lua-protobuf` |
-| Sensor Semáforo | Java 17 | JVM | `protobuf-java` |
+| Sensor Poste | Lua 5.4 | LuaSocket | `lua-protobuf`, `luaposix` |
+| Sensor Semáforo | Java 21 | JVM | `protobuf-java` |
 | Sensor Câmera | Python 3.11 | threading | `protobuf` |
 | Serialização | — | — | Protocol Buffers 3 |
 | Persistência | — | — | SQLite 3 (WAL mode) |
@@ -185,17 +185,17 @@ podman exec gateway sqlite3 db/smartcity_gateway.db \
 |---------|-------|-----------|-----------|
 | `gateway` | **5000** | UDP | Ingestão de telemetria contínua |
 | `gateway` | **5001** | TCP | Interface cliente (dashboard) |
+| `gateway` | **5002** | UDP | Registro de handshakes de descoberta |
+| `gateway` | **5005** | UDP | Grupo multicast 239.0.0.1 — probes de topologia |
 | `dashboard` | **8501** | TCP/HTTP | Interface web Streamlit |
 
 ### Internas (rede Compose)
 
 | Serviço | Porta | Protocolo | Descrição |
 |---------|-------|-----------|-----------|
-| `gateway` | 5002 | UDP | Recepção de handshakes de descoberta |
-| `sensor_posto` | 5002 | TCP | Servidor de controle (Lua) |
+| `sensor_posto` | 5006 | TCP | Servidor de controle (Lua) |
 | `sensor_semaforo` | 5003 | TCP | Servidor de controle (Java) |
 | `sensor_camera` | 5004 | TCP | Servidor de controle (Python) |
-| Multicast | 5005 | UDP | Grupo 239.0.0.1 — probes de recovery |
 
 > O sensor C não possui porta TCP — opera exclusivamente como emissor UDP.
 
@@ -237,7 +237,7 @@ Configure no `docker-compose.yml` sob a chave `environment:` de cada serviço.
 |----------|--------|-----------|
 | `SENSOR_HEARTBEAT_INTERVAL_SECS` | `10` | Intervalo base para renovar presença no Gateway via `DiscoveryResponse` |
 | `SENSOR_HEARTBEAT_JITTER_SECS` | `2` | Jitter adicional do heartbeat para evitar rajadas sincronizadas |
-| `C_DEVICE_COUNT` | `3` | Número de estações ambientais simuladas |
+| `C_DEVICE_COUNT` | `6` | Número de estações ambientais simuladas (padrão definido no `docker-compose.yml`; o binário usa 3 sem override) |
 
 ### sensor_posto (Lua)
 
@@ -276,7 +276,7 @@ Todas as métricas são transmitidas como campos `Metric { name, value, unit }` 
 
 ### Sensor Clima — sensor_clima (C)
 
-Simula 3 estações ambientais nos setores Pici, Benfica e Porangabussu.
+Simula 6 estações ambientais nos setores Pici, Benfica e Porangabussu (padrão definido no `docker-compose.yml`).
 
 | Métrica | Unidade | Faixa simulada | Descrição |
 |---------|---------|---------------|-----------|
@@ -429,11 +429,13 @@ O processamento estatístico ocorre inteiramente no gateway. O cliente recebe ap
 | Operação | Enum | Descrição |
 |----------|------|-----------|
 | Média Aritmética | `OP_AVERAGE` | Média simples sobre a janela temporal |
-| Desvio Padrão | `OP_STD_DEV` | Dispersão em relação à média |
+| Desvio Padrão | `OP_STD_DEV` | Dispersão dos valores em relação à média |
+| Maior Variação | `OP_MAX_VARIATION` | Dispositivo com maior amplitude (máx − mín) na janela; retorna o valor da variação e identifica o sensor responsável |
 
 Parâmetros:
 - **Métrica alvo** — 12 disponíveis (ver catálogo acima)
 - **Janela temporal** — últimas 1 a 24 horas
+- **Dispositivo alvo** — opcional; quando omitido, a consulta agrega toda a frota
 
 O gateway escolhe automaticamente a fonte da consulta:
 - janelas curtas usam `metrics`;
@@ -441,6 +443,22 @@ O gateway escolhe automaticamente a fonte da consulta:
 - janelas longas usam `metrics_rollup_5m` ou `metrics_rollup_1h`.
 
 Se uma base antiga ainda não tiver rollups preenchidos, o gateway faz fallback para a tabela bruta para preservar compatibilidade.
+
+### Aba 4 — Inspeção Individual
+
+Diagnóstico focado em um único dispositivo, com filtragem estrita por `device_id`.
+
+| Campo | Opções |
+|-------|--------|
+| Dispositivo analisado | Selecionado entre todos os registrados |
+| Métrica operacional | Restrita às métricas disponíveis para o tipo do dispositivo selecionado |
+| Janela temporal | Últimas 1 a 24 horas |
+
+Retorna:
+- **Amostras extraídas** — contagem total de pontos no intervalo
+- **Intervalo médio entre amostras** — média do delta entre timestamps consecutivos, indicando a frequência efetiva de envio
+- **Taxa de eventos no mesmo segundo** — proporção de datagramas com timestamps idênticos (esperado em cenários de disparo por limiar + telemetria periódica simultâneos)
+- **Gráfico de série temporal** — valores da métrica ao longo do tempo para aquele dispositivo específico
 
 ---
 
@@ -482,7 +500,7 @@ Além do envio periódico, os sensores simulam amostras intermediárias e emitem
 
 ### Detecção automática de offline
 
-O gateway marca dispositivos sem `last_seen` recente como `STATUS_OFF` usando `DEVICE_OFFLINE_TIMEOUT_SECS`. Como os IDs agora são estáveis e os sensores possuem heartbeat explícito, reiniciar um sensor atualiza o mesmo registro no SQLite em vez de criar uma nova chave fantasma.
+O gateway marca dispositivos sem `last_seen` recente como `STATUS_OFF` usando `DEVICE_OFFLINE_TIMEOUT_SECS`. Como os IDs são estáveis e os sensores possuem heartbeat explícito, reiniciar um sensor atualiza o mesmo registro no SQLite em vez de criar uma nova chave fantasma.
 
 ### Graceful Shutdown
 
@@ -491,7 +509,7 @@ O gateway marca dispositivos sem `last_seen` recente como `STATUS_OFF` usando `D
 | C | `sigaction(SIGTERM/SIGINT)` → cancela thread POSIX → libera sockets e DNS |
 | Python | `signal.signal` → `threading.Event` → threads daemon encerram com o processo |
 | Java | threads separadas; encerramento natural no `System.exit` |
-| Lua | event-loop síncrono; sem shutdown explícito necessário |
+| Lua | `posix.signal(SIGTERM/SIGINT)` via `luaposix` → seta `keep_running = false` → teardown envia `STATUS_OFF` e fecha sockets |
 
 ---
 
@@ -508,7 +526,7 @@ projeto-sockets/
 │   └── Dockerfile
 │
 ├── client/
-│   ├── app.py                  # Dashboard Streamlit (descoberta, controle, OLAP)
+│   ├── app.py                  # Dashboard Streamlit (descoberta, controle, OLAP, inspeção)
 │   └── Dockerfile
 │
 ├── sensor_c/
@@ -521,11 +539,14 @@ projeto-sockets/
 │
 ├── sensor_java/
 │   ├── sensor.java             # Semáforo JVM — threads separadas para TCP, multicast e telemetria
-│   └── Dockerfile              # Build multi-estágio JDK 17 → JRE slim
+│   └── Dockerfile              # Build multi-estágio JDK 21 → JRE slim
 │
 ├── sensor_python/
 │   ├── sensor.py               # Câmera de tráfego — threading + shutdown via Event
 │   └── Dockerfile
+│
+├── scripts/
+│   └── podman-compose.ps1      # Helper PowerShell para Podman Compose no Windows
 │
 ├── Dockerfile                  # Fallback multi-stage usado por Podman Compose no Windows
 └── docker-compose.yml          # Orquestração compatível com Docker Compose e Podman Compose
@@ -538,7 +559,8 @@ projeto-sockets/
 - **SQLite WAL mode** ativado no boot para melhorar concorrência de leituras simultâneas
 - **Pool de conexões** (`SQLiteConnectionPool`) com fila asyncio evita bloqueio do event loop em picos de telemetria
 - **Sensor C multi-frota** registra e envia telemetria para N dispositivos no mesmo processo, com `pthread` dedicada ao listener multicast
-- **Sensor Lua** implementa scheduling cooperativo manual (sem threads) via `socket.sleep` e timestamps de controle
+- **Sensor Lua** implementa scheduling cooperativo manual (sem threads) via `socket.sleep` e timestamps de controle; inclui fila não-bloqueante de retransmissão UDP com limite de 32 entradas e drenagem de até 4 itens por ciclo, evitando que falhas de rede bloqueiem o loop principal
+- **Sensor Python** implementa coalescência de probes multicast: respostas de descoberta pendentes são acumuladas em fila e enviadas em lote único com jitter, eliminando rajadas causadas por múltiplos probes consecutivos do gateway
 - **Sensor Java** usa `volatile` nos campos de estado para segurança entre threads sem overhead de `synchronized` completo
 - **Healthchecks** verificam o TCP :5001 do gateway, as portas TCP dos sensores controláveis, a porta web do dashboard e o processo do sensor C; os probes multicast periódicos permitem re-sincronização caso algum runtime Compose inicie serviços fora da ordem esperada
 - **Dockerfile raiz** replica os builds dos serviços como estágios nomeados para contornar providers Podman Compose que ignoram `build.dockerfile`
